@@ -3,6 +3,9 @@
  * 基于真实 CLI 流量抓包数据构建
  */
 import http from 'http';
+import https from 'https';
+import tls from 'tls';
+import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
@@ -24,6 +27,7 @@ function loadConfig() {
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
+    upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -45,6 +49,7 @@ function loadConfig() {
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
+  if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
 
   return defaults;
 }
@@ -144,15 +149,18 @@ async function refreshCCVersion() {
 refreshCCVersion(); // 启动时立即拉取
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
-// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
+// 请求体大小上限：默认 8MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）。
+// 默认值已从 100MB 下调（issue #20 Finding 2）：
 // ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
 //    chunks[] / Buffer.concat / utf8 字符串 / JSON.parse 对象树 / buildCcRequest 重建对象树 / JSON.stringify 序列化体。
 //    实测峰值 ≈ body 大小 × 5.1~7.4（7MB→+52MB，20MB→+116MB；而 413 拒绝路径只要 ×1.05）。
-//    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，且该上限是每请求的、不是全局的。
-//    公网/多用户部署请在反向代理层同时限制 body 大小与在途请求数（见 README「内存与部署」）。
+//    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，对 Dockerfile 面向的 1 核小 VPS 不是合理默认值；
+//    8MB 对应约 45MB/请求，且 413 走的是丢弃分支、几乎零成本。
+//    该上限仍是每请求的、不是全局的：公网部署请在反向代理层限流，
+//    或用 CC_MAX_INFLIGHT / config.maxInflight 打开进程内全局在途上限。
 const MAX_BODY_SIZE = (() => {
   const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
-  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
+  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 8 * 1024 * 1024;
 })();
 // 上游读空闲超时（issue #19）：只计「reader.read() 的等待」，每收到一个 chunk 重置，
 // 不是整个请求的总时长。默认值保持不变（30s / 90s），可用环境变量覆盖 ——
@@ -314,7 +322,7 @@ async function ensureInitialized(apiKey, signal) {
     const fingerprint = state.fingerprint || {};
 
     await Promise.all([
-      fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+      upstreamFetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
         method: 'POST', headers, signal,
         body: JSON.stringify(fingerprint),
       }).then(r => {
@@ -324,7 +332,7 @@ async function ensureInitialized(apiKey, signal) {
         if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
       }),
 
-      fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+      upstreamFetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
         method: 'POST', headers, signal,
         body: JSON.stringify({
           eventType: 'cli_session_exists',
@@ -964,6 +972,117 @@ function getApiKey(headers) {
   return null;
 }
 
+// ── 上游 HTTP(S) 代理（issue #18）────────────────────
+// 仅作用于发往 CC 上游的请求（/alpha/generate、/provider/v1/models）。
+// 本地监听、/health 与 npm registry 版本检查都不经过代理。
+//
+// 零依赖实现：自己建立 CONNECT 隧道，再用 node:https 复用同一个 socket，
+// 因此不需要 undici / https-proxy-agent，engines >=18 也能用。
+// 注意 Node 原生 fetch 不读 HTTPS_PROXY/HTTP_PROXY；官方的环境变量方案需要
+// Node >= 22.21 / 24.5 并设 NODE_USE_ENV_PROXY=1（README 有说明）。
+const UPSTREAM_PROXY = CFG.upstreamProxy || '';
+const PROXY_CONNECT_TIMEOUT_MS = 15000;
+
+function parseProxyUrl(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`upstreamProxy is not a valid URL: ${raw}`);
+  }
+  if (u.protocol !== 'http:') {
+    throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
+  }
+  const auth = u.username
+    ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
+    : null;
+  return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
+}
+
+/** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
+function headersToInit(raw) {
+  const out = [];
+  for (const [k, v] of Object.entries(raw)) {
+    if (Array.isArray(v)) { for (const item of v) out.push([k, String(item)]); }
+    else if (v !== undefined) out.push([k, String(v)]);
+  }
+  return out;
+}
+
+/** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
+async function proxyFetch(urlStr, options = {}) {
+  const proxy = parseProxyUrl(UPSTREAM_PROXY);
+  const u = new URL(urlStr);
+  const isTls = u.protocol === 'https:';
+  const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
+  const target = `${u.hostname}:${port}`;
+  const { signal, body } = options;
+  const onAbort = (fn) => { if (signal) signal.addEventListener('abort', fn, { once: true }); };
+
+  // 1. CONNECT 隧道 —— 代理只做裸字节转发，TLS 由本端端到端完成
+  const rawSocket = await new Promise((resolve, reject) => {
+    const connectReq = http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: target,
+      headers: { Host: target, ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
+      timeout: PROXY_CONNECT_TIMEOUT_MS,
+    });
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`upstream proxy CONNECT ${target} failed: HTTP ${res.statusCode}`));
+        return;
+      }
+      resolve(socket);
+    });
+    connectReq.on('timeout', () => connectReq.destroy(new Error('upstream proxy CONNECT timeout')));
+    connectReq.on('error', reject);
+    onAbort(() => { try { connectReq.destroy(); } catch {} });
+    connectReq.end();
+  });
+
+  // 2. 隧道上做 TLS（证书按目标主机名校验，不做任何降级）
+  let socket = rawSocket;
+  if (isTls) {
+    socket = tls.connect({ socket: rawSocket, servername: u.hostname });
+    await new Promise((resolve, reject) => {
+      socket.once('secureConnect', resolve);
+      socket.once('error', reject);
+      onAbort(() => { try { socket.destroy(); } catch {} });
+    });
+  }
+
+  // 3. 复用隧道 socket 发请求
+  return await new Promise((resolve, reject) => {
+    const mod = isTls ? https : http;
+    const req = mod.request({
+      host: u.hostname,
+      port,
+      path: u.pathname + u.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      createConnection: () => socket,
+    }, (res) => {
+      resolve(new Response(Readable.toWeb(res), {
+        status: res.statusCode,
+        statusText: res.statusMessage,
+        headers: headersToInit(res.headers),
+      }));
+    });
+    req.on('error', reject);
+    onAbort(() => { try { req.destroy(); } catch {} });
+    if (body !== undefined && body !== null) req.write(body);
+    req.end();
+  });
+}
+
+/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
+function upstreamFetch(urlStr, options) {
+  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -994,7 +1113,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     headers['x-cmd-zdr'] = '1';
   }
 
-  const response = await fetch(url, {
+  const response = await upstreamFetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -1032,6 +1151,10 @@ async function handleChatCompletions(req, res) {
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
+  // issue #20：ccBody 建好后，openaiReq 这棵 20MB 级对象树只剩 prompt_cache_key 还被用到。
+  // 先取出该值再断开引用，让这一份副本可以更早被 GC 回收（原来是整段请求期间一直活着）。
+  const promptCacheKey = openaiReq.prompt_cache_key;
+  openaiReq = null;
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   const abortController = new AbortController();
@@ -1046,7 +1169,7 @@ async function handleChatCompletions(req, res) {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -1838,8 +1961,12 @@ async function handleMessages(req, res) {
   const model = anthropicReq.model || 'claude-sonnet-4-6';
 
   // Convert Anthropic → OpenAI → CC
-  const openaiReq = convertAnthropicToOpenAI(anthropicReq);
+  let openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
+  // issue #20：ccBody 已建好，原始请求树（anthropicReq）与中间树（openaiReq）都不再被引用，
+  // 显式断开以便尽早回收 —— 否则它们会和 ccBody 一起活到整段请求结束。
+  openaiReq = null;
+  anthropicReq = null;
 
   const abortController = new AbortController();
   let aborted = false;
@@ -2152,7 +2279,7 @@ async function fetchModels(apiKey) {
   try {
     if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
-    const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
+    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'x-cli-environment': 'production',
@@ -2950,6 +3077,7 @@ server.listen(CFG.port, CFG.host, () => {
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
+    upstreamProxy: UPSTREAM_PROXY || '(direct)',
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
@@ -2961,7 +3089,7 @@ server.listen(CFG.port, CFG.host, () => {
     log('warn', 'Request body limit implies high per-request worst-case memory', {
       maxBodyMB: bodyCapMB,
       worstCaseRSSPerRequestMB: worstCaseMB,
-      hint: 'lower CC_MAX_BODY_MB and/or cap in-flight requests at the reverse proxy (see README)',
+      hint: 'lower CC_MAX_BODY_MB, set CC_MAX_INFLIGHT, and/or cap in-flight requests at the reverse proxy (see README)',
     });
   }
   if (!CFG.apiKey) {
