@@ -113,7 +113,11 @@ The salt is optional but recommended: without it the derivation is a pure functi
 
 The hash construction follows the official CLI (`buildMachineFingerprint` / `hashSignal` in `command-code`) — `thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))` with `IB = "command-code:device-fingerprint:v1"`, and each component hashed as `sha256(IB + "\0" + value.toLowerCase())`. The previous implementation hashed random hex without the `IB` prefix and built the thumbmark from the component *hashes*; upstream cannot recompute either way (it never sees the raw `machineId`), so it was undetectable — but it is now aligned.
 
-> Not addressed here: the appearance pool is still all high-end desktop CPUs and the timezone is still drawn from a global pool. On a single-egress-IP deployment, a cluster of machines spread across 15 timezones is a distribution that does not look like real users. Binding `timezone` to the egress IP is the natural next step, but it depends on deployment specifics, so it is left to the operator.
+> Not addressed here: the appearance pool is still all high-end desktop CPUs and the timezone is drawn uniformly from a global pool.
+>
+> `timezone` is the **client machine's OS timezone** (`Intl.DateTimeFormat().resolvedOptions().timeZone`), *not* the egress IP's. So do **not** bind it to the egress IP: a user in mainland China reaching this service through a proxy normally has a machine timezone that does not match where the traffic exits, and that mismatch is the norm rather than an anomaly.
+>
+> The property that matters is therefore the **distribution across your own user base**, not agreement with the IP. If your users are concentrated in one region, drawing timezones uniformly from 15 global zones makes every account look like it belongs to a different continent. Set the pool to match who actually uses the deployment — this is an operator decision, and for a single-region user base it means narrowing (or weighting) `FINGERPRINT_TZS` rather than randomising it globally.
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 

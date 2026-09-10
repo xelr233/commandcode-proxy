@@ -111,7 +111,11 @@ CC_FP_MODE=random npm start              # 回退：恢复原「每进程随机�
 
 哈希构造对齐官方 CLI（`command-code` 的 `buildMachineFingerprint` / `hashSignal`）：`thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))`，其中 `IB = "command-code:device-fingerprint:v1"`；各 component 按 `sha256(IB + "\0" + value.toLowerCase())` 计算。原实现直接对随机 hex 求 sha256（缺 `IB` 前缀），且 thumbmark 由各 component 的**哈希**拼成 —— 上游两种都无从验算（它拿不到原始 `machineId`），所以检测不到；现在已对齐。
 
-> 本次未处理：外观池仍是清一色高端桌面 CPU，时区仍从全球池里取。在单出口 IP 的部署上，一批散布在 15 个时区、型号又高度相似的机器，不是一个像真实用户的分布。把 `timezone` 绑定到出口 IP 是自然的下一步，但这取决于具体部署，留给运维决定。
+> 本次未处理：外观池仍是清一色高端桌面 CPU，时区仍从全球池里均匀取。
+>
+> `timezone` 是**客户端本机操作系统的时区**（`Intl.DateTimeFormat().resolvedOptions().timeZone`），**不是出口 IP 的时区**。所以**不要**把它绑定到出口 IP：中国大陆用户通过代理访问本服务时，本机时区与流量出口地不一致是**常态而非异常**。
+>
+> 真正有意义的性质是**它在你自身用户群里的分布**，而不是与 IP 是否一致。如果你的用户集中在一个地区，却从 15 个全球时区里均匀取，就会让每个账号看起来来自不同的大洲。应当让池子匹配实际使用这个部署的人群 —— 这是运维决策：单一地区用户群应当收窄（或加权）`FINGERPRINT_TZS`，而不是全球随机。
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
