@@ -84,9 +84,9 @@ to the npm version check or the proxy's `/provider/v1/models` catalog request.
 This requests Command Code's ZDR-only routing; the upstream service remains the
 authority for actual retention and provider availability.
 
-**Request body limit**: independent of `config.json` — requests larger than **8 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB). The default was lowered from 100 MB ([#20](https://github.com/MAXeaglet/commandcode-proxy/issues/20)).
+**Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
-> ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The old default `CC_MAX_BODY_MB=100` implied up to ~550 MB for a **single** request, which is not a sane default for the 1-core VPS the Dockerfile targets. The default is now **8 MB** (~45 MB peak per request). The limit is still per-request, not global — cap concurrency with `CC_MAX_INFLIGHT` or at the reverse proxy. See [Memory & Deployment](#memory--deployment).
+> ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 
@@ -489,7 +489,7 @@ npm run docker:build:multi
 |----------|---------|-------------|
 | `PORT` | `3050` | Container listen port |
 | `PROXY_PORT` | `3050` | Host port (compose only) |
-| `CC_MAX_BODY_MB` | `8` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
+| `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
 | `CC_UPSTREAM_PROXY` | *(unset)* | `http://host:port` CONNECT proxy for upstream Command Code requests only |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |
@@ -509,6 +509,8 @@ CC_MAX_INFLIGHT=32 npm start    # at most 32 concurrent requests
 Over the limit it returns `503` + `Retry-After: 5` + `type: server_busy` — a shape the official OpenAI / Anthropic SDKs retry with backoff, instead of the client seeing a connection reset. `/health` and `/` are exempt so liveness probes and orchestrators never receive a 503 because business traffic is busy.
 
 **Why it exists**: memory is `in-flight × (0.13 MB + 5.5 × body_MB)`. `CC_MAX_BODY_MB` bounds only the **per-request** term; nothing bounds the multiplier — at the default 100 MB, N concurrent requests can cost N × 550 MB.
+
+> **Why the default body cap stays at 100 MB**: [#7](https://github.com/MAXeaglet/commandcode-proxy/issues/7) recorded a legitimate multimodal session (21 base64 images, ~10.11 MiB) hitting the old 10 MB cap, so the threshold cannot be lowered without breaking real usage — which is exactly why the concurrency side has to be bounded instead. The startup warning about implied worst-case memory is advisory; `CC_MAX_INFLIGHT` is the enforcement.
 
 > ⚠️ Enabling this is **not** the same as being memory-safe: 32 × 550 MB still exceeds a small box. For a hard bound, lower `CC_MAX_BODY_MB` **as well**.
 

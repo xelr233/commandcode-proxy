@@ -149,18 +149,22 @@ async function refreshCCVersion() {
 refreshCCVersion(); // 启动时立即拉取
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
-// 请求体大小上限：默认 8MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）。
-// 默认值已从 100MB 下调（issue #20 Finding 2）：
+// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）。
+// 默认值保持 100MB（573e260 为修 issue #7 设定）——不要下调，理由是有实际证据的：
+//   #7 的真实触发场景是多模态长会话，21 张 Base64 图片累积到约 10.11 MiB 的合法请求，
+//   下调到 4~8MB 会把这类请求整体挡在门外。#7 的「Connection error」症状由
+//   「超限返回 413 + 排空连接」这条路径解决，与阈值取值无关；但阈值决定了功能边界，
+//   所以默认值必须容纳真实的多模态上下文。
 // ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
 //    chunks[] / Buffer.concat / utf8 字符串 / JSON.parse 对象树 / buildCcRequest 重建对象树 / JSON.stringify 序列化体。
 //    实测峰值 ≈ body 大小 × 5.1~7.4（7MB→+52MB，20MB→+116MB；而 413 拒绝路径只要 ×1.05）。
-//    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，对 Dockerfile 面向的 1 核小 VPS 不是合理默认值；
-//    8MB 对应约 45MB/请求，且 413 走的是丢弃分支、几乎零成本。
-//    该上限仍是每请求的、不是全局的：公网部署请在反向代理层限流，
-//    或用 CC_MAX_INFLIGHT / config.maxInflight 打开进程内全局在途上限。
+//    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，且该上限是每请求的、不是全局的。
+//    正因为阈值必须留足，#20 的第二半必须补齐：并发侧要有约束。
+//    进程内可用 CC_MAX_INFLIGHT，边缘侧用反向代理 limit_conn
+//    （见 README「内存与部署」）。
 const MAX_BODY_SIZE = (() => {
   const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
-  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 8 * 1024 * 1024;
+  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
 })();
 // 上游读空闲超时（issue #19）：只计「reader.read() 的等待」，每收到一个 chunk 重置，
 // 不是整个请求的总时长。默认值保持不变（30s / 90s），可用环境变量覆盖 ——

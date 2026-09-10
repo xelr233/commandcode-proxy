@@ -82,9 +82,9 @@ commandcode/
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
 header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数据留存和上游可用性仍由上游服务决定。
 
-**请求体上限**：独立于 `config.json` —— 超过 **8MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。默认值已由 100MB 下调（[issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20)）。
+**请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
-> ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。旧的默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，对 Dockerfile 面向的 1 核小 VPS 不是合理默认值，现已下调为 **8MB**（约 45MB/请求）。该上限仍是每请求的、不是全局的 —— 用 `CC_MAX_INFLIGHT` 或在反向代理层一并封顶并发。详见[内存与部署](#内存与部署)。
+> ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
@@ -487,7 +487,7 @@ npm run docker:build:multi
 |------|--------|------|
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
-| `CC_MAX_BODY_MB` | `8` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
+| `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
 | `CC_UPSTREAM_PROXY` | 空 | 仅作用于 CC 上游请求的 `http://host:port` CONNECT 代理 |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
@@ -508,6 +508,8 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 超限时快速返回 `503` + `Retry-After: 5` + `type: server_busy` —— OpenAI / Anthropic 官方 SDK 认得这个组合会自动退避重试，而不是拿到连接被重置。`/health` 与 `/` 不计入、也不受限制，避免探活与编排器因业务繁忙收到 503。
 
 **为什么需要它**：内存 = `在途数 × (0.13MB + 5.5 × body_MB)`。`CC_MAX_BODY_MB` 只管住**单请求**量级，乘数无人管 —— 默认 100MB 时 N 个并发最坏可达 N × 550MB。
+
+> **为什么 body 默认值保持 100MB**：[#7](https://github.com/MAXeaglet/commandcode-proxy/issues/7) 记录了一个合法的多模态长会话（21 张 base64 图片，约 10.11 MiB）会撞上旧的 10MB 上限 —— 阈值降不下去，正因为此才必须去约束并发侧。启动时那条「最坏内存」warn 只是提示，`CC_MAX_INFLIGHT` 才是执行层。
 
 > ⚠️ 开启本项**不等于**内存安全：32 × 550MB 仍远超小机器容量。要拿到硬性上界，需**同时**下调 `CC_MAX_BODY_MB`。
 
