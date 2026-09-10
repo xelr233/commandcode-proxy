@@ -77,6 +77,8 @@ commandcode/
 | `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
 | `CC_UPSTREAM_PROXY` | `upstreamProxy` |
+| `CC_FP_MODE` | `fpMode` (`derived` default, `random` to opt out) |
+| `CC_FP_SALT` | `fpSalt` |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -87,6 +89,31 @@ authority for actual retention and provider availability.
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+### Device fingerprint (`fpMode` / `CC_FP_MODE`, `fpSalt` / `CC_FP_SALT`)
+
+The device fingerprint reported to `/alpha/fingerprint/record` is **derived deterministically** from the API key (`HMAC-SHA256(CC_FP_SALT, apiKey)`), so one key is always one device:
+
+| Event | Old behaviour (random) | Now (derived) |
+|---|---|---|
+| Process restart | Map cleared → **new machine** | same machine |
+| Second instance | same key = **two machines** | same machine |
+| Session expiry (12h) | `keyStateStore.delete` → **new machine every 12h** | same machine |
+
+> The 12h case was the most visible: a real user does not replace their computer twice a day, and upstream's `device_fingerprints` table is keyed on `(userId, thumbmark)`.
+
+**Why derived rather than "pick a device from a hash bucket"** — a fixed pool caps entropy at the pool size, so once the number of keys exceeds it, keys *must* share a fingerprint. With ~50 keys and a 1000-entry pool, ~2 keys collide; with a 100-entry pool, ~20 do. A shared `thumbmark` under two different `userId`s is direct evidence of multi-account-same-machine — exactly what you don't want to manufacture. Derivation keeps every key a distinct device (collision probability 2⁻²⁵⁶) while still being stable.
+
+```bash
+CC_FP_SALT=some-local-secret npm start   # optional: isolates fingerprints between deployments
+CC_FP_MODE=random npm start              # opt out: old random-per-process behaviour
+```
+
+The salt is optional but recommended: without it the derivation is a pure function of the API key, so anyone who knows the scheme could recompute your users' fingerprints. With it, the same key yields different devices on different deployments, at no cost.
+
+The hash construction follows the official CLI (`buildMachineFingerprint` / `hashSignal` in `command-code`) — `thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))` with `IB = "command-code:device-fingerprint:v1"`, and each component hashed as `sha256(IB + "\0" + value.toLowerCase())`. The previous implementation hashed random hex without the `IB` prefix and built the thumbmark from the component *hashes*; upstream cannot recompute either way (it never sees the raw `machineId`), so it was undetectable — but it is now aligned.
+
+> Not addressed here: the appearance pool is still all high-end desktop CPUs and the timezone is still drawn from a global pool. On a single-egress-IP deployment, a cluster of machines spread across 15 timezones is a distribution that does not look like real users. Binding `timezone` to the egress IP is the natural next step, but it depends on deployment specifics, so it is left to the operator.
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 
@@ -380,7 +407,7 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
+| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; **derived deterministically from the API key** (see [Device fingerprint](#device-fingerprint-fpmode--cc_fp_mode-fpsalt--cc_fp_salt)), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
 | **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
@@ -491,6 +518,8 @@ npm run docker:build:multi
 | `PROXY_PORT` | `3050` | Host port (compose only) |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
 | `CC_UPSTREAM_PROXY` | *(unset)* | `http://host:port` CONNECT proxy for upstream Command Code requests only |
+| `CC_FP_MODE` | `derived` | `derived` = stable per-key device fingerprint; `random` = old behaviour |
+| `CC_FP_SALT` | *(unset)* | Salt for fingerprint derivation; isolates devices between deployments |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout in ms |
@@ -624,7 +653,7 @@ A more robust cap still belongs at the reverse proxy (`limit_conn`), since only 
 
 - **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
 - **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
-- **Multi-account + multiple instances**: `sessionStore` / `keyStateStore` are per-process `Map`s, so the same API key served by two instances gets two different sessions and **two different device fingerprints** — upstream sees one account on multiple machines. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
+- **Multi-account + multiple instances**: `sessionStore` is still a per-process `Map`, so the same API key served by two instances gets two different sessions. **The device fingerprint is no longer affected** — it is derived, so it is the same machine across instances and restarts (see [Device fingerprint](#device-fingerprint-fpmode--cc_fp_mode-fpsalt--cc_fp_salt)). Consistent hashing on the API key (`hash $cc_key consistent`) is still recommended to keep session affinity, rather than round-robin.
 
 ## Disclaimer
 

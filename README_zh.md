@@ -77,6 +77,8 @@ commandcode/
 | `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
 | `CC_UPSTREAM_PROXY` | `upstreamProxy` |
+| `CC_FP_MODE` | `fpMode`（默认 `derived`，`random` 回退） |
+| `CC_FP_SALT` | `fpSalt` |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -85,6 +87,31 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+### 设备指纹（`fpMode` / `CC_FP_MODE`，`fpSalt` / `CC_FP_SALT`）
+
+上报给 `/alpha/fingerprint/record` 的设备指纹，现在由 API key **确定性派生**（`HMAC-SHA256(CC_FP_SALT, apiKey)`），因此一个 key 恒定对应一台设备：
+
+| 事件 | 原行为（随机） | 现行为（派生） |
+|---|---|---|
+| 进程重启 | Map 清空 → **换一台机器** | 同一台机器 |
+| 第二个实例 | 同一 key = **两台机器** | 同一台机器 |
+| session 过期（12h） | `keyStateStore.delete` → **每 12h 换一台机器** | 同一台机器 |
+
+> 12h 那条最明显：真实用户不会一天换两次电脑。而上游 `device_fingerprints` 表是按 `(userId, thumbmark)` 建唯一索引的。
+
+**为什么用「派生」而不是「按哈希取桶选设备」** —— 固定池的熵上限就是池的大小，key 数一旦超过池容量，多个 key 就**必然**共用指纹：约 50 个 key 配 1000 个池 → 约 2 个碰撞；配 100 个池 → 约 20 个碰撞。同一个 `thumbmark` 出现在两个不同 `userId` 下，就是「多账号同机」的直接证据 —— 这正是最不该主动制造的东西。派生方案每个 key 仍是独立设备（碰撞概率 2⁻²⁵⁶），同时保持稳定。
+
+```bash
+CC_FP_SALT=some-local-secret npm start   # 可选：隔离不同部署的指纹
+CC_FP_MODE=random npm start              # 回退：恢复原「每进程随机」行为
+```
+
+盐是可选的但建议设：不设时派生是 API key 的纯函数，知道算法的人可以反推出你所有用户的指纹；设了之后同一个 key 在不同部署上得到不同设备，且没有额外成本。
+
+哈希构造对齐官方 CLI（`command-code` 的 `buildMachineFingerprint` / `hashSignal`）：`thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))`，其中 `IB = "command-code:device-fingerprint:v1"`；各 component 按 `sha256(IB + "\0" + value.toLowerCase())` 计算。原实现直接对随机 hex 求 sha256（缺 `IB` 前缀），且 thumbmark 由各 component 的**哈希**拼成 —— 上游两种都无从验算（它拿不到原始 `machineId`），所以检测不到；现在已对齐。
+
+> 本次未处理：外观池仍是清一色高端桌面 CPU，时区仍从全球池里取。在单出口 IP 的部署上，一批散布在 15 个时区、型号又高度相似的机器，不是一个像真实用户的分布。把 `timezone` 绑定到出口 IP 是自然的下一步，但这取决于具体部署，留给运维决定。
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
@@ -378,7 +405,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 
 | 机制 | 实现 |
 |------|------|
-| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
+| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；**由 API key 确定性派生**（见[设备指纹](#设备指纹fpmode--cc_fp_modefpsalt--cc_fp_salt)）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
 | **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
 | **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
@@ -489,6 +516,8 @@ npm run docker:build:multi
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
 | `CC_UPSTREAM_PROXY` | 空 | 仅作用于 CC 上游请求的 `http://host:port` CONNECT 代理 |
+| `CC_FP_MODE` | `derived` | `derived` = 每 key 稳定设备指纹；`random` = 原行为 |
+| `CC_FP_SALT` | 空 | 指纹派生用的盐；隔离不同部署的设备 |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
@@ -627,7 +656,7 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 
 - **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
 - **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
-- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
+- **多账号 + 多实例**：`sessionStore` 仍是进程内 `Map`，同一个 API key 打到两个实例会得到两个不同 session。**设备指纹已不再是问题** —— 它现在是派生出来的，跨实例、跨重启都是同一台设备（见[设备指纹](#设备指纹fpmode--cc_fp_modefpsalt--cc_fp_salt)）。横向扩展仍建议按 API key 做一致性哈希（`hash $cc_key consistent`）以保持 session 亲和，不要轮询。
 
 ## 免责声明
 

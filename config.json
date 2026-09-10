@@ -7,5 +7,7 @@
   "logFile": "",
   "logLevel": "info",
   "zdr": false,
-  "upstreamProxy": ""
+  "upstreamProxy": "",
+  "fpMode": "derived",
+  "fpSalt": ""
 }

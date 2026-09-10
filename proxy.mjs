@@ -28,6 +28,8 @@ function loadConfig() {
     zdr: false,
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    fpMode: 'derived',            // 指纹来源：derived = 由 API key 确定性派生（默认），random = 每进程随机
+    fpSalt: '',                   // 派生用的本地盐；不设也能用，设了可隔离不同部署
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -50,13 +52,15 @@ function loadConfig() {
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+  if (process.env.CC_FP_MODE) defaults.fpMode = process.env.CC_FP_MODE === 'random' ? 'random' : 'derived';
+  if (process.env.CC_FP_SALT) defaults.fpSalt = process.env.CC_FP_SALT;
 
   return defaults;
 }
 
 const CFG = loadConfig();
 
-// ── 指纹生成（首次运行自动生成，写回 config.json） ──────
+// ── 设备指纹 ──────────────────────────────────────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
@@ -84,35 +88,82 @@ const FINGERPRINT_TZS = [
 ];
 const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
 
-function generateFingerprint() {
-  const cpuEntry = FINGERPRINT_CPUS[Math.floor(Math.random() * FINGERPRINT_CPUS.length)];
-  const memGiB = FINGERPRINT_MEMS[Math.floor(Math.random() * FINGERPRINT_MEMS.length)];
-  const tz = FINGERPRINT_TZS[Math.floor(Math.random() * FINGERPRINT_TZS.length)];
-  const macCount = FINGERPRINT_MAC_COUNT_RANGE[Math.floor(Math.random() * FINGERPRINT_MAC_COUNT_RANGE.length)];
+// 官方 CLI 的指纹算法常量（command-code 1.53.0 dist/cli.mjs，函数
+// buildMachineFingerprint / hashSignal / gatherRawSignals）：
+//
+//   const ib = "command-code:device-fingerprint:v1";
+//   hashSignal(v) = sha256(ib + "\0" + v.trim().toLowerCase())          // v 是原始值，不是哈希
+//   thumbmark     = sha256(ib + "\0machine\0" + [machineId, macs.join(",")].join("|"))
+//                   其中 machineId 非空时 hostname / cpuModel 不参与
+//
+// 原实现直接对随机 hex 求 sha256，缺 ib 前缀，且 thumbmark 的输入结构也不同
+// （把各 component 的哈希再拼起来）。上游没有原始 machineId、无法重算，这处
+// 不一致检测不到 —— 但既然要动，就一次对齐。
+const FINGERPRINT_IB = 'command-code:device-fingerprint:v1';
 
-  function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
-  function randHex(n) { return crypto.randomBytes(n).toString('hex'); }
+/**
+ * 生成一台"设备"的指纹。
+ *
+ * 默认（fpMode=derived）由 HMAC(CC_FP_SALT, apiKey) 确定性派生：同一个 key
+ * 在进程重启后、在多实例上都会得到同一台设备。这修掉原实现的三处漂移：
+ *   ① 进程重启 → Map 清空 → 同一 key 换新机器
+ *   ② 多实例 → 同一 key 在不同实例是两台机器
+ *   ③ session 过期清理连带 keyStateStore.delete → 每 12h 换一台机器
+ *
+ * 这与"按 key 取哈希桶选设备"有本质区别：桶方案的熵上限就是桶数，key 数一旦
+ * 超过桶数就必然出现多个 key 共用指纹，而上游 device_fingerprints 表对
+ * (userId, thumbmark) 建了唯一索引 —— 共用指纹等于"多账号同机"的直接证据。
+ * 派生方案每个 key 都是独立设备，碰撞概率 2^-256。
+ *
+ * fpMode=random 保留原随机行为（每进程一台新设备），用于回退。
+ */
+function deriveFingerprint(apiKey) {
+  const random = CFG.fpMode === 'random';
+  const salt = CFG.fpSalt || '';
+  // seed 只用来挑外观参数；token 用来造原始信号值
+  const seed = random ? crypto.randomBytes(32) : crypto.createHmac('sha256', salt).update(apiKey).digest();
+  const token = random
+    ? (_domain, bytes) => crypto.randomBytes(bytes).toString('hex')
+    : (domain, bytes) => crypto.createHmac('sha256', salt).update(apiKey).update('\0').update(domain).digest('hex').slice(0, bytes * 2);
+  const at = (off, mod) => seed.readUInt32BE(off % 28) % mod;
+  const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
 
-  const macHashes = [];
-  for (let i = 0; i < macCount; i++) macHashes.push(sha256(randHex(32)));
+  const cpuEntry = FINGERPRINT_CPUS[at(0, FINGERPRINT_CPUS.length)];
+  const memGiB = FINGERPRINT_MEMS[at(4, FINGERPRINT_MEMS.length)];
+  const tz = FINGERPRINT_TZS[at(8, FINGERPRINT_TZS.length)];
+  const macCount = FINGERPRINT_MAC_COUNT_RANGE[at(12, FINGERPRINT_MAC_COUNT_RANGE.length)];
 
-  const machineIdHash = sha256(randHex(32));
-  const osUserHash = sha256(randHex(16));
-  const hostnameHash = sha256(randHex(16));
-  const gitEmailHash = sha256(randHex(16));
+  // 原始信号值：只存在于本进程，出网的永远只有它们的哈希
+  const machineId = token('machineId', 16);
+  // 与 CLI 同构：[...new Set(list.map(x => x.toLowerCase()))].filter(Boolean).sort()
+  const macs = [...new Set(
+    Array.from({ length: macCount }, (_v, i) => token('mac:' + i, 6).match(/.{2}/g).join(':').toLowerCase()),
+  )].filter(Boolean).sort();
+  const osUser = 'dev' + token('osUser', 2);
+  const hostname = 'DESKTOP-' + token('hostname', 4).toUpperCase();
+  const gitEmail = token('gitEmail', 6) + '@example.com';
 
-  // thumbmark = 所有组件的联合哈希
-  const thumbData = [machineIdHash, ...macHashes, osUserHash, hostnameHash, gitEmailHash, 'win32', '10.0.22631', cpuEntry.model, String(cpuEntry.cores), String(memGiB)].join('|');
-  const thumbmark = sha256(thumbData);
+  // ── 以下与官方 CLI 逐行同构 ──
+  const hashSignal = v => {
+    const t = String(v).trim();
+    return t ? sha256(FINGERPRINT_IB + '\0' + t.toLowerCase()) : undefined;
+  };
+  const thumbParts = [
+    machineId.trim(),
+    macs.join(','),
+    machineId.trim() ? '' : hostname.trim(),        // machineId 非空 → 这两项不参与
+    machineId.trim() ? '' : cpuEntry.model.trim(),
+  ].filter(Boolean);
+  const thumbmark = sha256(FINGERPRINT_IB + '\0machine\0' + (thumbParts.join('|') || 'unknown'));
 
   return {
     thumbmark,
     components: {
-      machineIdHash,
-      macHashes,
-      osUserHash,
-      hostnameHash,
-      gitEmailHash,
+      machineIdHash: hashSignal(machineId),
+      macHashes: macs.map(hashSignal).filter(Boolean),
+      osUserHash: hashSignal(osUser),
+      hostnameHash: hashSignal(hostname),
+      gitEmailHash: hashSignal(gitEmail),
       platform: 'win32',
       arch: 'x64',
       osRelease: '10.0.22631',
@@ -251,14 +302,17 @@ function ensureSession(apiKey) {
   return sessionId;
 }
 
-// 定期清理过期 session 和 key 状态，防止 Map 无限增长
+// 定期清理过期 session，防止 Map 无限增长。
+// 注意：这里**不再**连带删除 keyStateStore。原实现写的是「同时清理该 key 的指纹状态」，
+// 但指纹是随机生成的，删掉就等于该 key 每 12h 换一台"电脑" —— 真实用户不会这样。
+// 指纹状态现在有自己的空闲淘汰（见下方），且因为指纹是派生出来的，
+// 即使被淘汰、下次重新派生得到的仍是同一台设备，不构成漂移。
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [key, entry] of sessionStore) {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
       cleaned++;
     }
   }
@@ -289,21 +343,39 @@ function isWireUuid(v) {
 }
 
 // ── 每 Key 独立状态（fingerprint + 初始化节流） ──
-// 每个 API Key 拥有自己的设备指纹和初始化定时器
-const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+// 指纹现在是确定性派生的，所以这个 Map 只是缓存：淘汰它不会改变该 key 的设备身份，
+// 只是下次多算一次 HMAC。淘汰按「空闲」而非「session 过期」判定，
+// 这样活跃 key 的 nextInitAt 不会被重置（否则会重复发送指纹/lifecycle 预请求）。
+const KEY_STATE_IDLE_MS = 24 * 60 * 60 * 1000; // 24h 未活动即淘汰
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, lastSeen }
 
 function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
   if (!state) {
     state = {
-      fingerprint: generateFingerprint(),
+      fingerprint: deriveFingerprint(apiKey),
       nextInitAt: 0,
+      lastSeen: 0,
     };
     keyStateStore.set(apiKey, state);
-    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
+    log('info', 'Fingerprint ' + (CFG.fpMode === 'random' ? 'generated' : 'derived') + ' for key', {
+      keyPrefix: apiKey.slice(0, 8),
+      thumbmark: state.fingerprint.thumbmark.slice(0, 12),
+    });
   }
+  state.lastSeen = Date.now();
   return state;
 }
+
+// 空闲淘汰：纯内存卫生，不影响设备身份（见上）
+setInterval(() => {
+  const now = Date.now();
+  let evicted = 0;
+  for (const [key, state] of keyStateStore) {
+    if (now - state.lastSeen > KEY_STATE_IDLE_MS) { keyStateStore.delete(key); evicted++; }
+  }
+  if (evicted > 0) log('info', 'Key state evicted (idle)', { evicted, remaining: keyStateStore.size });
+}, 60 * 60 * 1000); // 每小时
 
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
@@ -3082,6 +3154,9 @@ server.listen(CFG.port, CFG.host, () => {
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: UPSTREAM_PROXY || '(direct)',
+    fingerprint: CFG.fpMode === 'random'
+      ? 'random per key per process (CC_FP_MODE=random)'
+      : `derived from API key (salt: ${CFG.fpSalt ? 'set' : 'unset'})`,
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
