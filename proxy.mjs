@@ -268,8 +268,13 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   return ensureSession(apiKey);
 }
 
-// 每个请求独立 thread ID
-function newThreadId() { return randomUUID(); }
+// CC 线上信封的 threadId 只接受合法 UUID —— 对应 CLI 的 toWireThreadId：
+// uuid.safeParse 失败即返回 undefined，该键随之被 JSON.stringify 丢弃。
+// 非 UUID 的 session 值一律不发，避免上游看到真 CLI 永远不会产生的 threadId。
+function isWireUuid(v) {
+  return typeof v === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+}
 
 // ── 每 Key 独立状态（fingerprint + 初始化节流） ──
 // 每个 API Key 拥有自己的设备指纹和初始化定时器
@@ -538,8 +543,6 @@ function buildCcRequest(openaiReq) {
     if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
   }
 
-  const threadId = newThreadId();
-
   const body = {
     config: {
       workingDir: process.cwd(),
@@ -556,6 +559,10 @@ function buildCcRequest(openaiReq) {
     taste: null,
     skills: '',
     permissionMode: 'standard',
+    // threadId 由 forwardToCC 解析出 sessionId 后回填为 x-session-id 同值。
+    // 先在此占位以固定 JSON 键序，与 CLI 线上顺序一致（…permissionMode, threadId, params）；
+    // 值为 undefined 时 JSON.stringify 会整体丢弃该键。
+    threadId: undefined,
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
@@ -964,8 +971,15 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
 
+  // generate body 顶层 threadId 必须与 x-session-id 同值（CLI 抓包与源码双重确认）。
+  // 客户端未提供 session 头时，sessionId 仍来自 MAXeaglet 原有的 per-key 12h 会话
+  // （此路径行为完全不变），threadId 取同一个值，故两者恒等；
+  // 仅当 sessionId 不是合法 UUID 时省略该字段 —— 即 CLI toWireThreadId 的既有行为。
+  body.threadId = isWireUuid(sessionId) ? sessionId : undefined;
+
   const headers = {
     'Content-Type': 'application/json',
+    'User-Agent': 'cli',
     'Authorization': `Bearer ${apiKey}`,
     'x-cli-environment': 'production',
     'x-command-code-version': CC_VERSION,
