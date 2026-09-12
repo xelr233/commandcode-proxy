@@ -88,7 +88,7 @@ async function startRecordingProxy() {
 
 test('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', async () => {
   const rec = await startRecordingProxy();
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port,
     env: { CC_UPSTREAM_PROXY: 'http://127.0.0.1:' + rec.port } });
   try {
@@ -105,7 +105,7 @@ test('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', async ()
 
 test('#18: 预请求也走代理（避免同一账号从两个 IP 注册）', async () => {
   const rec = await startRecordingProxy();
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port,
     env: { CC_UPSTREAM_PROXY: 'http://127.0.0.1:' + rec.port } });
   try {
@@ -121,7 +121,7 @@ test('#18: 预请求也走代理（避免同一账号从两个 IP 注册）', as
 
 test('#18: 未配置代理时不建立任何 CONNECT', async () => {
   const rec = await startRecordingProxy();
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port });   // 不设 CC_UPSTREAM_PROXY
   try {
     const r = await proxy.post('/v1/chat/completions', CHAT, AUTH);
@@ -134,7 +134,7 @@ test('#18: 未配置代理时不建立任何 CONNECT', async () => {
 
 test('#18: 探活端点不经过上游代理', async () => {
   const rec = await startRecordingProxy();
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port,
     env: { CC_UPSTREAM_PROXY: 'http://127.0.0.1:' + rec.port } });
   try {
@@ -149,7 +149,7 @@ test('#18: 探活端点不经过上游代理', async () => {
 
 // ── 设备指纹派生 ─────────────────────────────────────────
 test('fork: 同一 API key 在同一盐下得到稳定 thumbmark（重启后不变）', async () => {
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const env = { CC_FP_SALT: 'ci-salt', CC_FP_MODE: 'derived' };
   const p1 = await startProxy({ upstreamPort: mock.port, env });
   let first;
@@ -171,7 +171,7 @@ test('fork: 同一 API key 在同一盐下得到稳定 thumbmark（重启后不�
 });
 
 test('fork: 不同 API key 得到不同 thumbmark', async () => {
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port, env: { CC_FP_SALT: 'ci-salt' } });
   try {
     for (const k of ['user_a', 'user_b', 'user_c']) {
@@ -186,7 +186,7 @@ test('fork: 不同 API key 得到不同 thumbmark', async () => {
 });
 
 test('fork: 不同盐得到不同部署指纹', async () => {
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const grab = async (salt) => {
     const p = await startProxy({ upstreamPort: mock.port, env: { CC_FP_SALT: salt } });
     try {
@@ -204,7 +204,7 @@ test('fork: 不同盐得到不同部署指纹', async () => {
 });
 
 test('fork: CC_FP_MODE=random 回退到原行为（重启换设备）', async () => {
-  const mock = startMockUpstream();
+  const mock = await startMockUpstream();
   const env = { CC_FP_MODE: 'random' };
   const grab = async () => {
     const p = await startProxy({ upstreamPort: mock.port, env });

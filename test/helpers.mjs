@@ -26,6 +26,20 @@ export async function allocPort() {
   });
 }
 
+/**
+ * 关闭一个 http server，且**保证有界**。
+ * server.close() 只停止接受新连接，会一直等到既有连接结束 —— 若有 keep-alive
+ * 或未被对端关闭的 socket，它会永远挂着，把 CI 拖到 job 超时。
+ * （实际发生过：Fork 测试漏写一个 await 导致 mock 泄漏，三个矩阵 job 全部
+ *   空转 10 分钟后被取消。）故先强制断开所有连接，再 close，并叠加兜底超时。
+ */
+export async function closeServer(server, timeoutMs = 3000) {
+  if (!server || !server.listening) return;
+  try { server.closeAllConnections?.(); } catch {}
+  await Promise.race([new Promise(r => server.close(r)), sleep(timeoutMs)]);
+  try { server.closeAllConnections?.(); } catch {}
+}
+
 /** 启动一个 mock 上游。ndjson 为要回给代理的 CC NDJSON 行数组。 */
 export async function startMockUpstream(opts = {}) {
   const port = await allocPort();
@@ -56,7 +70,7 @@ export async function startMockUpstream(opts = {}) {
     });
   });
   await new Promise(r => server.listen(port, '127.0.0.1', r));
-  return { port, seen, close: () => new Promise(r => server.close(r)),
+  return { port, seen, close: () => closeServer(server),
     // 最后一次 /alpha/generate 的请求体（wire 层断言的主要入口）
     lastGenerate: () => {
       const g = seen.filter(s => s.url === '/alpha/generate').pop();
