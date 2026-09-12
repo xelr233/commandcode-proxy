@@ -390,6 +390,11 @@ async function ensureInitialized(apiKey, signal) {
     // 并行发两个预请求
     const headers = {
       'Content-Type': 'application/json',
+      // 官方 CLI 的指纹预请求与生成请求共用同一个 header 常量表（lb = vy = "cli"），
+      // 因此预请求同样是 User-Agent: cli。此前只有 forwardToCC 设了它，
+      // 预请求走 Node 默认的 "node" —— 同一账号的指纹注册与生成请求来自两种 UA，
+      // 是可直接观测的破绽。
+      'User-Agent': 'cli',
       'x-cli-environment': 'production',
       'Authorization': `Bearer ${apiKey}`,
       'x-command-code-version': CC_VERSION,

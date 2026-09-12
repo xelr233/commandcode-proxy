@@ -49,19 +49,30 @@ test('fork: threadId 与 x-session-id 同值', async () => {
   } finally { await s.close(); }
 });
 
-test('fork: sessionId 非 UUID 时省略 threadId（而非填非法值）', async () => {
+test('fork: threadId 恒等于 x-session-id（含非 UUID 回落路径）', async () => {
   const s = await setup();
   try {
-    // CLI 的 toWireThreadId 对非 UUID 返回 undefined —— 代理必须同样省略该字段
+    // 任意 >=8 字符的 session 头都会被 getSessionId 采纳（不限于 UUID），
+    // 此时 threadId 必须与之一致 —— 这正是「两者同值」的不变量。
     const r = await s.proxy.post('/v1/chat/completions', CHAT,
-      { ...AUTH, 'x-session-id': 'not-a-uuid' });
+      { ...AUTH, 'x-session-id': 'not-a-uuid-but-long-enough' });
     await r.text();
     const g = s.mock.lastGenerate();
-    // 非 UUID 的 session 头会被忽略，回落到 per-key 生成的合法 UUID
-    const tid = g.body.threadId;
-    assert.ok(tid === undefined || /^[0-9a-f-]{36}$/.test(tid),
-      'threadId 要么省略，要么是合法 UUID，不能是任意字符串。实际: ' + JSON.stringify(tid));
-    assert.equal(tid, g.headers['x-session-id'], '若存在则必须与 x-session-id 同值');
+    assert.equal(g.headers['x-session-id'], 'not-a-uuid-but-long-enough');
+    assert.equal(g.body.threadId, g.headers['x-session-id'],
+      'threadId 必须等于实际发出的 x-session-id');
+  } finally { await s.close(); }
+});
+
+test('fork: 无 session 头时回落 per-key session，threadId 仍与之同值', async () => {
+  const s = await setup();
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);   // 不带 session 头
+    await r.text();
+    const g = s.mock.lastGenerate();
+    const sid = g.headers['x-session-id'];
+    assert.ok(sid, '应回落到 per-key session');
+    assert.equal(g.body.threadId, sid, '回落路径下两者同样必须同值');
   } finally { await s.close(); }
 });
 
