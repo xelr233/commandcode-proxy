@@ -10,6 +10,19 @@ import { fileURLToPath } from 'node:url';
 
 export const REPO = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]test$/, '');
 
+// ── 挂起保护 ──────────────────────────────────────────────
+// 不能用 --test-timeout：Node 18 没有该选项（20.11 才加入），加了会让
+// engines 下限直接跑不起来。改用启动一个 unref 的定时器，进程若因泄漏
+// 的 socket / 未 await 的句柄而无法退出，到点强制退出并说明原因。
+// 正常结束时定时器被 unref，不阻止退出。
+const HANG_GUARD_MS = Number(process.env.CC_TEST_HANG_GUARD_MS ?? 120000);
+const hangGuard = setTimeout(() => {
+  console.error('[test] 超时未退出：疑似有 server/socket 未关闭（' +
+    '检查每个测试是否都在 finally 里 await close()）。强制退出。');
+  process.exit(1);
+}, HANG_GUARD_MS);
+hangGuard.unref?.();
+
 // 取一个当前空闲的端口：让内核分配（listen 0）后立刻释放。
 // 不能用 pid 派生区间 —— node --test 各文件并行，pid 取模会在不同 pid 间
 // 映射到同一区间（如 pid 100 与 pid 600 同桶），进而偶发 EADDRINUSE。
