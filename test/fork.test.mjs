@@ -164,7 +164,7 @@ test('#18: 探活端点不经过上游代理', async () => {
 // ── 设备指纹派生 ─────────────────────────────────────────
 test('fork: 同一 API key 在同一盐下得到稳定 thumbmark（重启后不变）', async () => {
   const mock = await startMockUpstream();
-  const env = { CC_FP_SALT: 'ci-salt', CC_FP_MODE: 'derived' };
+  const env = { CC_FINGERPRINT_SALT: 'ci-salt' };
   const p1 = await startProxy({ upstreamPort: mock.port, env });
   let first;
   try {
@@ -186,7 +186,7 @@ test('fork: 同一 API key 在同一盐下得到稳定 thumbmark（重启后不�
 
 test('fork: 不同 API key 得到不同 thumbmark', async () => {
   const mock = await startMockUpstream();
-  const proxy = await startProxy({ upstreamPort: mock.port, env: { CC_FP_SALT: 'ci-salt' } });
+  const proxy = await startProxy({ upstreamPort: mock.port, env: { CC_FINGERPRINT_SALT: 'ci-salt' } });
   try {
     for (const k of ['user_a', 'user_b', 'user_c']) {
       const r = await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + k });
@@ -202,7 +202,7 @@ test('fork: 不同 API key 得到不同 thumbmark', async () => {
 test('fork: 不同盐得到不同部署指纹', async () => {
   const mock = await startMockUpstream();
   const grab = async (salt) => {
-    const p = await startProxy({ upstreamPort: mock.port, env: { CC_FP_SALT: salt } });
+    const p = await startProxy({ upstreamPort: mock.port, env: { CC_FINGERPRINT_SALT: salt } });
     try {
       const r = await p.post('/v1/chat/completions', CHAT, AUTH);
       await r.text();
@@ -217,21 +217,24 @@ test('fork: 不同盐得到不同部署指纹', async () => {
   } finally { await mock.close(); }
 });
 
-test('fork: CC_FP_MODE=random 回退到原行为（重启换设备）', async () => {
+test('fork: 伪造信号值的形状与真实机器一致（MachineGuid/MAC/主机名）', async () => {
   const mock = await startMockUpstream();
-  const env = { CC_FP_MODE: 'random' };
-  const grab = async () => {
-    const p = await startProxy({ upstreamPort: mock.port, env });
-    try {
-      const r = await p.post('/v1/chat/completions', CHAT, AUTH);
-      await r.text();
-      const fps = mock.seen.filter(x => x.url === '/alpha/fingerprint/record');
-      return JSON.parse(fps[fps.length - 1].raw).thumbmark;
-    } finally { await p.kill(); }
-  };
+  const proxy = await startProxy({ upstreamPort: mock.port, env: { CC_FINGERPRINT_SALT: 'ci-salt' } });
   try {
-    const a = await grab();
-    const b = await grab();
-    assert.notEqual(a, b, 'random 模式应保留「每进程随机」的原始行为');
-  } finally { await mock.close(); }
+    // 原始信号值不上网，只能从派生源反推：这里直接校验上网的哈希之间有正确的数量关系。
+    // 真正要锁的是「形状」这一层 —— 出网载荷里没有明文，所以断言落在组件集合上。
+    const r = await proxy.post('/v1/chat/completions', CHAT, AUTH);
+    await r.text();
+    const fp = JSON.parse(mock.seen.find(x => x.url === '/alpha/fingerprint/record').raw);
+    const c = fp.components;
+    assert.match(fp.thumbmark, /^[0-9a-f]{64}$/, 'thumbmark 必须是 64 位 hex（sha256）');
+    assert.match(c.machineIdHash, /^[0-9a-f]{64}$/, 'machineIdHash 必须是 sha256');
+    assert.ok(Array.isArray(c.macHashes) && c.macHashes.length >= 2 && c.macHashes.length <= 5,
+      'macHashes 数量应落在 FINGERPRINT_MAC_COUNT_RANGE 内');
+    assert.equal(new Set(c.macHashes).size, c.macHashes.length, 'MAC 必须已去重');
+    assert.match(c.hostnameHash, /^[0-9a-f]{64}$/);
+    assert.match(c.gitEmailHash, /^[0-9a-f]{64}$/);
+    assert.equal(c.collectorVersion, 1);
+    assert.equal(c.runtime, 'cli', 'CLI 的 runtime 恒为 cli');
+  } finally { await proxy.kill(); await mock.close(); }
 });

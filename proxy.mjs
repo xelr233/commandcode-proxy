@@ -26,10 +26,12 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
+    cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
+    cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
+    fingerprintSalt: '',
+    deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
-    fpMode: 'derived',            // 指纹来源：derived = 由 API key 确定性派生（默认），random = 每进程随机
-    fpSalt: '',                   // 派生用的本地盐；不设也能用，设了可隔离不同部署
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -50,17 +52,19 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
+  if (process.env.CC_FINGERPRINT_SALT !== undefined) defaults.fingerprintSalt = process.env.CC_FINGERPRINT_SALT;
+  if (process.env.CC_DEVICE_PROJECT_DIR) defaults.deviceProjectDir = process.env.CC_DEVICE_PROJECT_DIR;
+  if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
+  if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
-  if (process.env.CC_FP_MODE) defaults.fpMode = process.env.CC_FP_MODE === 'random' ? 'random' : 'derived';
-  if (process.env.CC_FP_SALT) defaults.fpSalt = process.env.CC_FP_SALT;
 
   return defaults;
 }
 
 const CFG = loadConfig();
 
-// ── 设备指纹 ──────────────────────────────────────
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.54.0 复核未变） ──
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
@@ -88,89 +92,108 @@ const FINGERPRINT_TZS = [
 ];
 const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
 
-// 官方 CLI 的指纹算法常量（command-code 1.53.0 dist/cli.mjs，函数
-// buildMachineFingerprint / hashSignal / gatherRawSignals）：
+// ── 为什么指纹必须由 apiKey 确定性派生（而不是随机） ──────────────
+// 指纹代表「这个账号对应的那台设备」。原实现每进程随机生成一台新机器，
+// 会在三个场景下毫无理由地漂移：① 进程重启 ② 多实例各算各的
+// ③ session 过期清理连带 keyStateStore.delete。设备身份无故更换本身就是信号。
 //
-//   const ib = "command-code:device-fingerprint:v1";
-//   hashSignal(v) = sha256(ib + "\0" + v.trim().toLowerCase())          // v 是原始值，不是哈希
-//   thumbmark     = sha256(ib + "\0machine\0" + [machineId, macs.join(",")].join("|"))
-//                   其中 machineId 非空时 hostname / cpuModel 不参与
+// 也不能退化成「按 key 取哈希桶选设备」：桶方案的熵上限就是桶数，key 数一旦
+// 超过桶数必然出现多个 key 共用指纹，而上游 device_fingerprints 表对
+// (userId, thumbmark) 建了唯一索引 —— 共用指纹等于「多账号同机」的直接证据。
+// 派生方案每个 key 都是独立设备，碰撞概率 2^-256。
 //
-// 原实现直接对随机 hex 求 sha256，缺 ib 前缀，且 thumbmark 的输入结构也不同
-// （把各 component 的哈希再拼起来）。上游没有原始 machineId、无法重算，这处
-// 不一致检测不到 —— 但既然要动，就一次对齐。
-const FINGERPRINT_IB = 'command-code:device-fingerprint:v1';
+// 原始信号值（MachineGuid / MAC / 主机名 / git 邮箱）只存在于本进程内存，
+// 出网的永远只有它们的哈希。
+// CLI 的根盐（buildMachineFingerprint 常量 sb）
+const FP_SALT = 'command-code:device-fingerprint:v1';
+// 设备档案：指纹 / config.environment / config.workingDir / x-project-slug / lifecycle.os 共用同一份，
+// 避免出现「指纹说 win32、环境说 linux」这类自相矛盾，也避免把宿主机真实信息（平台、Node 版本、cwd）交给上游。
+const DEVICE_PROFILE = {
+  platform: 'win32',
+  arch: 'x64',
+  osRelease: '10.0.22631',
+  isContainer: false,
+  // 伪造的项目目录：与 x-project-slug 同源（真机里 slug = slugify(workingDir)）
+  projectDir: CFG.deviceProjectDir || 'C:\\Users\\dev\\projects\\app',
+};
+const FP_OS_USERS = ['dev', 'user', 'admin', 'coder', 'engineer', 'work'];
+const FP_MAIL_DOMAINS = ['gmail.com', 'outlook.com', 'qq.com', '163.com'];
 
-/**
- * 生成一台"设备"的指纹。
- *
- * 默认（fpMode=derived）由 HMAC(CC_FP_SALT, apiKey) 确定性派生：同一个 key
- * 在进程重启后、在多实例上都会得到同一台设备。这修掉原实现的三处漂移：
- *   ① 进程重启 → Map 清空 → 同一 key 换新机器
- *   ② 多实例 → 同一 key 在不同实例是两台机器
- *   ③ session 过期清理连带 keyStateStore.delete → 每 12h 换一台机器
- *
- * 这与"按 key 取哈希桶选设备"有本质区别：桶方案的熵上限就是桶数，key 数一旦
- * 超过桶数就必然出现多个 key 共用指纹，而上游 device_fingerprints 表对
- * (userId, thumbmark) 建了唯一索引 —— 共用指纹等于"多账号同机"的直接证据。
- * 派生方案每个 key 都是独立设备，碰撞概率 2^-256。
- *
- * fpMode=random 保留原随机行为（每进程一台新设备），用于回退。
- */
-function deriveFingerprint(apiKey) {
-  const random = CFG.fpMode === 'random';
-  const salt = CFG.fpSalt || '';
-  // seed 只用来挑外观参数；token 用来造原始信号值
-  const seed = random ? crypto.randomBytes(32) : crypto.createHmac('sha256', salt).update(apiKey).digest();
-  const token = random
-    ? (_domain, bytes) => crypto.randomBytes(bytes).toString('hex')
-    : (domain, bytes) => crypto.createHmac('sha256', salt).update(apiKey).update('\0').update(domain).digest('hex').slice(0, bytes * 2);
-  const at = (off, mod) => seed.readUInt32BE(off % 28) % mod;
-  const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
+// 伪造信号的派生源。加 CC_FINGERPRINT_SALT 可成批换身份 —— 真实账号的 key 动不了，这是逃生口。
+// 注意：哈希阶段用的是 CLI 的固定盐（FP_SALT），salt 只影响「伪造出哪台机器」。
+function fpDigest(apiKey, field) {
+  return crypto.createHash('sha256')
+    .update(`${CFG.fingerprintSalt || ''}\0${apiKey}\0${field}`)
+    .digest();
+}
+// 从候选池确定性地挑一项：打分取最大。以后往池里加候选只影响「新候选恰好胜出」的那部分 key，
+// 不会像取模那样因为池长度变化让所有 key 一起换设备。
+function fpPickIndex(apiKey, field, items, labelOf) {
+  let bestIdx = 0;
+  let bestScore = null;
+  for (let i = 0; i < items.length; i++) {
+    const score = fpDigest(apiKey, `${field}\0${labelOf(i)}`);
+    if (!bestScore || Buffer.compare(score, bestScore) > 0) { bestScore = score; bestIdx = i; }
+  }
+  return bestIdx;
+}
+// CLI 的 hashSignal：sha256(FP_SALT + "\0" + value.toLowerCase())，空值返回 undefined（JSON 里被丢掉）
+function fingerprintHash(value) {
+  const v = String(value ?? '').trim();
+  if (!v) return undefined;
+  return crypto.createHash('sha256').update(`${FP_SALT}\0${v.toLowerCase()}`).digest('hex');
+}
 
-  const cpuEntry = FINGERPRINT_CPUS[at(0, FINGERPRINT_CPUS.length)];
-  const memGiB = FINGERPRINT_MEMS[at(4, FINGERPRINT_MEMS.length)];
-  const tz = FINGERPRINT_TZS[at(8, FINGERPRINT_TZS.length)];
-  const macCount = FINGERPRINT_MAC_COUNT_RANGE[at(12, FINGERPRINT_MAC_COUNT_RANGE.length)];
+// 与 CLI 的唯一区别是「信号值」：CLI 读真实机器（注册表 / ioreg / machine-id、网卡 MAC、
+// os.userInfo、git config），这里按 apiKey 确定性地伪造一组逼真值。
+// 为什么必须由 apiKey 派生而不是随机：指纹代表「这个账号对应的那台设备」，重启、内存回收、
+// 多实例、月额度用尽停用数周后恢复，上游都应看到同一台设备；换指纹本身就是可疑信号。
+function generateFingerprint(apiKey) {
+  const cpuEntry = FINGERPRINT_CPUS[fpPickIndex(apiKey, 'cpu', FINGERPRINT_CPUS, i => `${FINGERPRINT_CPUS[i].model}|${FINGERPRINT_CPUS[i].cores}`)];
+  const memGiB = FINGERPRINT_MEMS[fpPickIndex(apiKey, 'mem', FINGERPRINT_MEMS, i => String(FINGERPRINT_MEMS[i]))];
+  const tz = FINGERPRINT_TZS[fpPickIndex(apiKey, 'timezone', FINGERPRINT_TZS, i => FINGERPRINT_TZS[i])];
+  const macCount = FINGERPRINT_MAC_COUNT_RANGE[fpPickIndex(apiKey, 'macCount', FINGERPRINT_MAC_COUNT_RANGE, i => String(FINGERPRINT_MAC_COUNT_RANGE[i]))];
+  const osUser = FP_OS_USERS[fpPickIndex(apiKey, 'osUser', FP_OS_USERS, i => FP_OS_USERS[i])];
+  const mailDomain = FP_MAIL_DOMAINS[fpPickIndex(apiKey, 'mailDomain', FP_MAIL_DOMAINS, i => FP_MAIL_DOMAINS[i])];
+  const hex = (field, bytes) => fpDigest(apiKey, field).subarray(0, bytes).toString('hex');
+  // Windows MachineGuid 形状：8-4-4-4-12
+  const mid = hex('machineId', 16);
+  const machineId = `${mid.slice(0, 8)}-${mid.slice(8, 12)}-${mid.slice(12, 16)}-${mid.slice(16, 20)}-${mid.slice(20, 32)}`;
+  const macs = [];
+  for (let i = 0; i < macCount; i++) {
+    const b = fpDigest(apiKey, `mac${i}`).subarray(0, 6);
+    macs.push([...b].map(x => x.toString(16).padStart(2, '0')).join(':'));
+  }
+  macs.sort(); // CLI 对 MAC 去重后排序
+  const hostname = `DESKTOP-${hex('hostname', 4).toUpperCase()}`;
+  const gitEmail = `${osUser}.${hex('gitEmail', 3)}@${mailDomain}`;
 
-  // 原始信号值：只存在于本进程，出网的永远只有它们的哈希
-  const machineId = token('machineId', 16);
-  // 与 CLI 同构：[...new Set(list.map(x => x.toLowerCase()))].filter(Boolean).sort()
-  const macs = [...new Set(
-    Array.from({ length: macCount }, (_v, i) => token('mac:' + i, 6).match(/.{2}/g).join(':').toLowerCase()),
-  )].filter(Boolean).sort();
-  const osUser = 'dev' + token('osUser', 2);
-  const hostname = 'DESKTOP-' + token('hostname', 4).toUpperCase();
-  const gitEmail = token('gitEmail', 6) + '@example.com';
+  const machineIdHash = fingerprintHash(machineId);
+  const macHashes = macs.map(fingerprintHash).filter(Boolean);
+  const osUserHash = fingerprintHash(osUser);
+  const hostnameHash = fingerprintHash(hostname);
+  const gitEmailHash = fingerprintHash(gitEmail);
 
-  // ── 以下与官方 CLI 逐行同构 ──
-  const hashSignal = v => {
-    const t = String(v).trim();
-    return t ? sha256(FINGERPRINT_IB + '\0' + t.toLowerCase()) : undefined;
-  };
-  const thumbParts = [
-    machineId.trim(),
-    macs.join(','),
-    machineId.trim() ? '' : hostname.trim(),        // machineId 非空 → 这两项不参与
-    machineId.trim() ? '' : cpuEntry.model.trim(),
-  ].filter(Boolean);
-  const thumbmark = sha256(FINGERPRINT_IB + '\0machine\0' + (thumbParts.join('|') || 'unknown'));
+  // CLI 的 thumbmark：主盐 + "\0machine\0" + join([machineId, macs.join(",")])
+  // （machineId 非空时不再拼 hostname/cpuModel）
+  const thumbSeed = [machineId.trim(), macs.join(','), machineId.trim() ? '' : hostname, machineId.trim() ? '' : cpuEntry.model].filter(Boolean);
+  const thumbmark = crypto.createHash('sha256').update(`${FP_SALT}\0machine\0${thumbSeed.join('|') || 'unknown'}`).digest('hex');
 
   return {
     thumbmark,
     components: {
-      machineIdHash: hashSignal(machineId),
-      macHashes: macs.map(hashSignal).filter(Boolean),
-      osUserHash: hashSignal(osUser),
-      hostnameHash: hashSignal(hostname),
-      gitEmailHash: hashSignal(gitEmail),
-      platform: 'win32',
-      arch: 'x64',
-      osRelease: '10.0.22631',
+      machineIdHash,
+      macHashes,
+      osUserHash,
+      hostnameHash,
+      gitEmailHash,
+      platform: DEVICE_PROFILE.platform,
+      arch: DEVICE_PROFILE.arch,
+      osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
       cpuCount: cpuEntry.cores,
       memGiB,
-      isContainer: false,
+      isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
       runtime: 'cli',
       collectorVersion: 1,
@@ -178,27 +201,37 @@ function deriveFingerprint(apiKey) {
   };
 }
 
-let CC_VERSION = '0.32.3';
-const CC_VERSION_FALLBACK = '0.32.3';
-const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.53.1 源码）。
+// 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
+// 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
+// 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
+const CC_PROTOCOL_VERSION = '1.53.1';
+let CC_VERSION = CC_PROTOCOL_VERSION;
+const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
-// ── 动态 CC 版本号（从 npm registry 拉取） ─────────────
-async function refreshCCVersion() {
+// ── 协议漂移检测（只告警，不改版本号） ─────────────
+// 上游 CLI 更新可能带来协议变化。这里只负责提醒「该重新读包对齐了」，
+// 绝不会把 x-command-code-version 改成一个我们并未实现的版本。
+async function checkProtocolDrift() {
   try {
     const url = 'https://registry.npmjs.org/command-code/latest';
     const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
     if (!res.ok) throw new Error(`npm responded with ${res.status}`);
     const pkg = await res.json();
-    if (pkg.version && typeof pkg.version === 'string') {
-      CC_VERSION = pkg.version;
-      log('info', 'CC Version refreshed from npm', { version: CC_VERSION });
+    const latest = typeof pkg?.version === 'string' ? pkg.version : null;
+    if (latest && latest !== CC_PROTOCOL_VERSION) {
+      log('warn', 'CC CLI version drift: protocol may have changed, re-align from the npm package', {
+        implemented: CC_PROTOCOL_VERSION, latest,
+      });
+    } else if (latest) {
+      log('info', 'CC CLI version in sync', { version: latest });
     }
   } catch (e) {
-    log('warn', 'CC Version fetch failed, using current', { version: CC_VERSION, error: e.message });
+    log('warn', 'CC version check failed', { error: e.message });
   }
 }
-refreshCCVersion(); // 启动时立即拉取
-setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+checkProtocolDrift(); // 启动时立即检查
+setInterval(checkProtocolDrift, CC_VERSION_REFRESH_MS);
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）。
 // 默认值保持 100MB（573e260 为修 issue #7 设定）——不要下调，理由是有实际证据的：
@@ -353,12 +386,12 @@ function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
   if (!state) {
     state = {
-      fingerprint: deriveFingerprint(apiKey),
+      fingerprint: generateFingerprint(apiKey),
       nextInitAt: 0,
       lastSeen: 0,
     };
     keyStateStore.set(apiKey, state);
-    log('info', 'Fingerprint ' + (CFG.fpMode === 'random' ? 'generated' : 'derived') + ' for key', {
+    log('info', 'Fingerprint derived for key', {
       keyPrefix: apiKey.slice(0, 8),
       thumbmark: state.fingerprint.thumbmark.slice(0, 12),
     });
@@ -420,7 +453,7 @@ async function ensureInitialized(apiKey, signal) {
           metadata: {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
-            mode: 'interactive',
+            mode: CFG.cliSessionMode || 'interactive',
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
@@ -483,31 +516,14 @@ const MODELS = [
 
 // ── 工具函数 ───────────────────────────────────────
 
-// 从 sessionId 构造一个假的工作目录路径，再按真实 CLI 规则生成 slug
-// 结果形如 "d-users-dev-projects-web-app-a3f2" (和真实 CLI 的 slug 格式一致)
-function fakeProjectSlug(sessionId) {
-  const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
-    'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
-  const id = String(sessionId || '');
-  const head = id.slice(0, 4);
-  // sessionId 既可能是随机 UUID（前 4 位十六进制），也可能是客户端自定义的
-  // prompt_cache_key（如 "my-stable-cache-key-001"）。后者按 16 进制解析得 NaN，
-  // 会让 slug 变成 "…-undefined-my-s"。失败时退化为确定性字符哈希。
-  let idx = parseInt(head, 16);
-  if (!Number.isFinite(idx)) {
-    let h = 0;
-    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-    idx = h;
-  }
-  const name = names[idx % names.length];
-  const suffix = head || '0000';
-  // 模拟一个类似 C:\Users\dev\projects\{name}-{suffix} 的路径
-  const path = `C:\\Users\\dev\\projects\\${name}-${suffix}`;
-  return path
+// CLI 的 slug 规则：对**完整工作目录**做 slugify（@sindresorhus/slugify），空则 "root"，无随机后缀；
+// 同一个 slug 也是 CLI 本地会话目录名。所以 slug 与 config.workingDir 同源：slug = slugify(workingDir)。
+function slugifyProjectPath(p) {
+  const s = String(p || '')
     .toLowerCase()
-    .replace(/^[a-z]:/i, '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+  return s || 'root';
 }
 
 function generateTraceparent() {
@@ -524,26 +540,35 @@ function getDateStr() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function getEnvironment() {
-  return `${process.platform}-${process.arch}, Node.js ${process.version.slice(1)}`;
-}
 
 // ── CC 请求体构建 ─────────────────────────────────
 
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
-  // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
-  // 数组型 content 必须展开取 text 后拼成「字符串」，而不是转成 JSON 字符串，
-  // 更不能输出 Anthropic 风格的 content 块数组：CC 上游要求 params.system 恒为
-  // 字符串，传数组会被直接拒绝（真机验证：
-  // Validation error: Invalid input: expected string, received array at "params.system"）。
+  // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
+  // 形态对齐 CLI 的 toWireSystem —— **块数组**，非最后一块补 \n，cache_control 逐块保留。
+  // （CLI 的 composeSystemPrompt：基础提示词是字符串时发字符串、是 sections 时发块数组；
+  //   真机验证两种形态服务端都接受，见 PROTOCOL-FACTS-1.53.1.md。这里统一用块数组，
+  //   才能把客户端标在 system 上的缓存断点原样送上去。）
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
-  const systemPrompt = systemMsgs.map(m => {
-    if (typeof m.content === 'string') return m.content;
-    if (Array.isArray(m.content)) return m.content.map(c => c?.text ?? c?.content ?? '').join('\n');
-    return m.content == null ? '' : String(m.content);
-  }).join('\n');
+  const systemBlocks = [];
+  for (const m of systemMsgs) {
+    if (typeof m.content === 'string') {
+      if (m.content) systemBlocks.push({ type: 'text', text: m.content });
+    } else if (Array.isArray(m.content)) {
+      for (const c of m.content) {
+        const text = c?.text ?? c?.content ?? '';
+        if (text === '' && !c?.cache_control) continue;
+        const block = { type: 'text', text: String(text) };
+        if (c?.cache_control) block.cache_control = c.cache_control;
+        systemBlocks.push(block);
+      }
+    } else if (m.content != null) {
+      systemBlocks.push({ type: 'text', text: String(m.content) });
+    }
+  }
+  for (let i = 0; i < systemBlocks.length - 1; i++) systemBlocks[i].text += '\n';
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
@@ -569,8 +594,11 @@ function buildCcRequest(openaiReq) {
         const parts = msg.content.map(part => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
-            return { type: 'image', image: url };
+            // CC CLI 真实格式: { type: "image", image: "data:<mime>;base64,...", mimeType: "<mime>" }
+            const mediaType = /^data:([^;,]+)/.exec(url)?.[1];
+            const imagePart = { type: 'image', image: url };
+            if (mediaType) imagePart.mimeType = mediaType;
+            return imagePart;
           }
           return part;
         }).filter(Boolean);
@@ -616,7 +644,7 @@ function buildCcRequest(openaiReq) {
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
           toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
-          output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
+          output: { type: 'text', value: toWireToolOutputValue(msg.content) },
         }],
       };
     }
@@ -624,19 +652,21 @@ function buildCcRequest(openaiReq) {
     return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
 
-  const hasMessageCacheMarker = ccMessages.some(msg =>
+  // 缓存断点：system 是块数组，断点可以原样留在 system 上（CLI 的 systemSections[].cache 同义）。
+  // 客户端已在任意消息块 / system 块上打过断点就保留；否则若给了 OpenAI 系的 prompt_cache_key，
+  // 把断点落在 system 最后一块 —— 缓存按前缀计算，system 正是最前的那段前缀。
+  const hasCacheMarker = systemBlocks.some(b => b.cache_control) || ccMessages.some(msg =>
     Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
-  if (prompt_cache_key && !hasMessageCacheMarker) {
-    const firstUserMessage = ccMessages.find(msg => msg.role === 'user' && Array.isArray(msg.content));
-    const cacheBoundary = firstUserMessage?.content.findLast(part => part?.type === 'text');
-    if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
+  if (prompt_cache_key && !hasCacheMarker && systemBlocks.length) {
+    systemBlocks[systemBlocks.length - 1].cache_control = { type: 'ephemeral' };
   }
 
   const body = {
     config: {
-      workingDir: process.cwd(),
+      // 伪造的项目目录（不再发宿主真实 cwd）；environment 用伪装的平台词，与指纹保持自洽
+      workingDir: DEVICE_PROFILE.projectDir,
       date: getDateStr(),
-      environment: getEnvironment(),
+      environment: DEVICE_PROFILE.platform,
       structure: [],
       isGitRepo: false,
       currentBranch: '',
@@ -646,12 +676,10 @@ function buildCcRequest(openaiReq) {
     },
     memory: null,
     taste: null,
-    skills: '',
+    skills: null,          // CLI 发 null，不是空串
     permissionMode: 'standard',
-    // threadId 由 forwardToCC 解析出 sessionId 后回填为 x-session-id 同值。
-    // 先在此占位以固定 JSON 键序，与 CLI 线上顺序一致（…permissionMode, threadId, params）；
-    // 值为 undefined 时 JSON.stringify 会整体丢弃该键。
-    threadId: undefined,
+    mode: CFG.cliMode || 'agent',
+    // threadId 需为合法 UUID，否则整键省略（CLI 的 toWireThreadId）—— 在 forwardToCC 拿到 sessionId 后补
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
@@ -661,8 +689,8 @@ function buildCcRequest(openaiReq) {
   };
 
   // 条件字段
-  if (systemPrompt) {
-    body.params.system = systemPrompt;
+  if (systemBlocks.length) {
+    body.params.system = systemBlocks;
   } else if (CFG.emptySystemPlaceholder) {
     // CC 上游在 params.system 缺省时会注入自身约 7.5K token 的默认提示词（进入
     // 默认上下文/前缀路径），既产生大量 cached tokens 又污染对话（模型会以为
@@ -670,7 +698,7 @@ function buildCcRequest(openaiReq) {
     // 真机验证 prompt_tokens 从 7653 降到 85。
     // 默认开启；config.json 设 "emptySystemPlaceholder": false 或环境变量
     // CC_EMPTY_SYSTEM_PLACEHOLDER=false 可关闭（回到原生的缺省行为）。
-    body.params.system = ' ';
+    body.params.system = [{ type: 'text', text: ' ' }];
   }
   if (temperature !== undefined) {
     body.params.temperature = temperature;
@@ -678,14 +706,13 @@ function buildCcRequest(openaiReq) {
   if (reasoning_effort !== undefined) {
     body.params.reasoning_effort = reasoning_effort;
   }
-  if (tools && tools.length > 0) {
-    body.params.tools = tools.map(t => ({
-      type: t.type || 'function',
-      name: t.function?.name || t.name || '',
+  // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
+  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
+  body.params.tools = (tools || []).map(t => ({
+      name: toWireToolName(t.function?.name || t.name || ''),
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
-  }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
     if (typeof tool_choice === 'string') {
@@ -703,6 +730,24 @@ function buildCcRequest(openaiReq) {
   }
 
   return body;
+}
+
+// CLI 发送前会重写部分工具名（resolveToolNameAlias / ow 表）
+const TOOL_NAME_ALIASES = {
+  bash_output: 'shell_output',
+  task_output: 'shell_output',
+  tool_search: 'search_tools',
+  read_multiple_files: 'read_file',
+};
+function toWireToolName(name) { return TOOL_NAME_ALIASES[name] || name; }
+
+// CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
+function toWireToolOutputValue(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.filter(c => c && c.type === 'text').map(c => c.text ?? '').join('\n');
+  }
+  return content == null ? '' : String(content);
 }
 
 function tryParseJSON(str) {
@@ -902,11 +947,15 @@ const CC_STATUS_MAP = {
 function mapCcError(ccStatus, ccBody) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
   let message = `CC API error (${ccStatus})`;
+  let code = null;
 
   if (ccBody) {
     try {
       const parsed = JSON.parse(ccBody);
       message = parsed.error?.message || parsed.message || message;
+      // 上游错误体：{"success":false,"error":{"code":"BAD_REQUEST"|"USAGE_EXCEEDED",...}}
+      // code 是上游的机器可读错误分类（BAD_REQUEST / USAGE_EXCEEDED 等），透出来便于下游 SDK 与运维判定
+      code = parsed.error?.code || parsed.code || null;
     } catch {
       message = ccBody.slice(0, 200) || message;
     }
@@ -916,18 +965,20 @@ function mapCcError(ccStatus, ccBody) {
   if (ccStatus === 429) {
     return {
       status: 429,
+      code,
       body: {
-        error: { message, type: 'rate_limit_error' },
+        error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) },
         retry_after: 30,
       },
     };
   }
 
-  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 function mapCcEventError(event) {
   const message = event.error?.message || event.message || 'Unknown CC error';
+  const code = event.error?.code || event.code || null;
   const statusMatch = message.match(/^<(\d{3})>/);
   const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
@@ -937,11 +988,12 @@ function mapCcEventError(event) {
   if (mapped.status === 429) {
     return {
       status: 429,
-      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+      code,
+      body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
     };
   }
 
-  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 // ── HTTP 请求处理 ──────────────────────────────────
@@ -1170,23 +1222,26 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
+  // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
+  if (isWireUuid(sessionId)) {
+    const ordered = {};
+    for (const k of ['config', 'memory', 'taste', 'skills', 'permissionMode']) ordered[k] = body[k];
+    ordered.threadId = sessionId;
+    for (const k of ['mode', 'promptCache', 'params']) if (k in body) ordered[k] = body[k];
+    body = ordered;
+  }
 
-  // generate body 顶层 threadId 必须与 x-session-id 同值（CLI 抓包与源码双重确认）。
-  // 客户端未提供 session 头时，sessionId 仍来自 MAXeaglet 原有的 per-key 12h 会话
-  // （此路径行为完全不变），threadId 取同一个值，故两者恒等；
-  // 仅当 sessionId 不是合法 UUID 时省略该字段 —— 即 CLI toWireThreadId 的既有行为。
-  body.threadId = isWireUuid(sessionId) ? sessionId : undefined;
-
+  // 与 CLI 的 buildCommandAuthHeaders 对齐：没有 x-co-flag；User-Agent 固定 "cli"
   const headers = {
     'Content-Type': 'application/json',
     'User-Agent': 'cli',
-    'Authorization': `Bearer ${apiKey}`,
-    'x-cli-environment': 'production',
     'x-command-code-version': CC_VERSION,
-    'x-session-id': sessionId,
-    'x-co-flag': 'false',
+    'x-cli-environment': 'production',
+    'x-project-slug': slugifyProjectPath(DEVICE_PROFILE.projectDir),
     'x-taste-learning': 'false',
-    'x-project-slug': fakeProjectSlug(sessionId),
+    'x-session-id': sessionId,
+    'Authorization': `Bearer ${apiKey}`,
     'traceparent': traceparent,
   };
 
@@ -1254,8 +1309,8 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
@@ -1642,14 +1697,20 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
 function convertAnthropicToOpenAI(anthropicReq) {
   // 1. Extract system prompt (top-level, not in messages array)
   let systemPrompt = '';
+  let systemBlocks = null;
   if (anthropicReq.system) {
     if (typeof anthropicReq.system === 'string') {
       systemPrompt = anthropicReq.system;
     } else if (Array.isArray(anthropicReq.system)) {
-      systemPrompt = anthropicReq.system
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
+      // 保留 cache_control：buildCcRequest 需要块数组才能把断点下发（CLI 的 params.system 就是块数组）
+      systemBlocks = anthropicReq.system
+        .filter(b => b && b.type === 'text')
+        .map(b => {
+          const blk = { type: 'text', text: b.text ?? '' };
+          if (b.cache_control) blk.cache_control = b.cache_control;
+          return blk;
+        });
+      systemPrompt = systemBlocks.map(b => b.text).join('\n');
     }
   }
 
@@ -1658,7 +1719,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
   const openaiMessages = [];
 
   if (systemPrompt) {
-    openaiMessages.push({ role: 'system', content: systemPrompt });
+    openaiMessages.push({ role: 'system', content: systemBlocks && systemBlocks.length ? systemBlocks : systemPrompt });
   }
 
   const messages = anthropicReq.messages || [];
@@ -1668,11 +1729,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
       // Anthropic 的 thinking block 承载思考内容，需转成 reasoning_content
       // 交给 buildCcRequest 回传，否则 CC 会因缺少 reasoning 而拒绝
       let thinkingContent = '';
+      const textParts = [];
+      let textHasCache = false;
       const toolCalls = [];
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }];
       for (const block of blocks) {
         if (block.type === 'text') {
           textContent += block.text || '';
+          const part = { type: 'text', text: block.text || '' };
+          if (block.cache_control) { part.cache_control = block.cache_control; textHasCache = true; }
+          textParts.push(part);
         } else if (block.type === 'thinking') {
           thinkingContent += block.thinking || '';
         } else if (block.type === 'tool_use') {
@@ -1687,12 +1753,15 @@ function convertAnthropicToOpenAI(anthropicReq) {
           });
         }
       }
-      const assistantMsg = { role: 'assistant', content: textContent || null };
+      const assistantMsg = { role: 'assistant', content: (textParts.length > 1 || textHasCache) ? textParts : (textContent || null) };
       if (thinkingContent) assistantMsg.reasoning_content = thinkingContent;
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       openaiMessages.push(assistantMsg);
     } else if (msg.role === 'user') {
       let textContent = '';
+      // parts 保持原始顺序（text / image_url），与 CLI 的 toWireMessages 一致
+      const parts = [];
+      let textHasCache = false;
       const toolResults = [];
       if (typeof msg.content === 'string') {
         textContent = msg.content;
@@ -1700,6 +1769,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
         for (const block of msg.content) {
           if (block.type === 'text') {
             textContent += block.text || '';
+            const part = { type: 'text', text: block.text || '' };
+            if (block.cache_control) { part.cache_control = block.cache_control; textHasCache = true; }
+            parts.push(part);
+          } else if (block.type === 'image') {
+            // Anthropic 图片块：{ type:'image', source:{ type:'base64', media_type, data } } 或 source.url
+            const s = block.source || {};
+            const url = s.type === 'base64' && s.data
+              ? `data:${s.media_type || 'image/png'};base64,${s.data}`
+              : (s.url || '');
+            if (url) parts.push({ type: 'image_url', image_url: { url } });
           } else if (block.type === 'tool_result') {
             toolResults.push(block);
           }
@@ -1711,7 +1790,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
       }
       for (const tr of toolResults) {
         const toolContent = typeof tr.content === 'string' ? tr.content
-          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('')
+          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('\n')
           : String(tr.content || '');
         // OpenAI 语义里 tool 消息的 name 是可选的；会话恢复等场景下 tool_use_id 可能
         // 找不到对应 assistant tool_use（历史被客户端裁剪），此时不硬塞空 name，
@@ -1720,8 +1799,11 @@ function convertAnthropicToOpenAI(anthropicReq) {
         if (toolNameFromId[tr.tool_use_id]) toolMsg.name = toolNameFromId[tr.tool_use_id];
         openaiMessages.push(toolMsg);
       }
-      if (textContent) {
-        openaiMessages.push({ role: 'user', content: textContent });
+      if (parts.length || textContent) {
+        // 单块纯文本仍用字符串（线格不变）；多块 / 带断点 / 含图片时用块数组（CLI 的形态）。
+        // 注意：content 为字符串时 parts 为空，必须用 textContent 判空（否则整条消息会丢）
+        const singleText = parts.length <= 1 && (parts.length === 0 || parts[0].type === 'text') && !textHasCache;
+        openaiMessages.push({ role: 'user', content: singleText ? textContent : parts });
       }
     }
   }
@@ -1929,7 +2011,10 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
           case 'finish-step':
           case 'finish': {
-            if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
+            // 上游的 finishReason 是 'tool-calls'（连字符），必须先过 mapFinishReason 规范化成
+            // 'tool_calls'，否则会掉进 mapAnthropicStopReason 的 default 变成 end_turn。
+            // 真机实测踩到过：工具调用成功但 stop_reason 报 end_turn。
+            if (event.finishReason) stopReason = mapAnthropicStopReason(mapFinishReason(event.finishReason));
             const u = event.totalUsage || event.usage;
             if (u) {
               normalizeUsage(u);
@@ -2064,8 +2149,8 @@ async function handleMessages(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
@@ -2440,7 +2525,13 @@ function convertResponsesToChat(respReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
-      switch (item.type) {
+      // OpenAI 规范里 input 数组的联合类型第一个成员是 EasyInputMessage，它的
+      // required 只有 role 与 content —— type 是可选的（官方文档与 SDK 示例普遍写作
+      // { role: 'user', content: 'hi' }）。item.type 为 undefined 但有 role 时按
+      // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
+      // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
+      // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
+      switch (item.type ?? (item.role ? 'message' : undefined)) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -2476,7 +2567,10 @@ function convertResponsesToChat(respReq) {
           });
           break;
         }
-        default: break;
+        default: {
+          log('warn', 'Unknown Responses input item type', { type: item.type });
+          break;
+        }
       }
     }
   }
@@ -2852,8 +2946,8 @@ async function handleResponses(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
     }
@@ -3159,9 +3253,7 @@ server.listen(CFG.port, CFG.host, () => {
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: UPSTREAM_PROXY || '(direct)',
-    fingerprint: CFG.fpMode === 'random'
-      ? 'random per key per process (CC_FP_MODE=random)'
-      : `derived from API key (salt: ${CFG.fpSalt ? 'set' : 'unset'})`,
+    fingerprint: `derived from API key (salt: ${CFG.fingerprintSalt ? 'set' : 'unset'})`,
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });

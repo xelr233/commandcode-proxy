@@ -77,8 +77,10 @@ commandcode/
 | `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
 | `CC_UPSTREAM_PROXY` | `upstreamProxy` |
-| `CC_FP_MODE` | `fpMode` (`derived` default, `random` to opt out) |
-| `CC_FP_SALT` | `fpSalt` |
+| `CC_FINGERPRINT_SALT` | `fingerprintSalt` (bulk-reset device identity) |
+| `CC_DEVICE_PROJECT_DIR` | `deviceProjectDir` (fabricated project dir; also drives `x-project-slug`) |
+| `CC_CLI_MODE` | `cliMode` (envelope `mode`) |
+| `CC_CLI_SESSION_MODE` | `cliSessionMode` (lifecycle metadata `mode`, a different enum) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -90,9 +92,11 @@ authority for actual retention and provider availability.
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
 
-### Device fingerprint (`fpMode` / `CC_FP_MODE`, `fpSalt` / `CC_FP_SALT`)
+### Device fingerprint
 
-The device fingerprint reported to `/alpha/fingerprint/record` is **derived deterministically** from the API key (`HMAC-SHA256(CC_FP_SALT, apiKey)`), so one key is always one device:
+Relevant config: `fingerprintSalt` / `CC_FINGERPRINT_SALT`, `deviceProjectDir` / `CC_DEVICE_PROJECT_DIR`.
+
+The device fingerprint reported to `/alpha/fingerprint/record` is **derived deterministically** from the API key (`fpDigest(apiKey, field) = sha256(salt + "\\0" + apiKey + "\\0" + field)`), so one key is always one device:
 
 | Event | Old behaviour (random) | Now (derived) |
 |---|---|---|
@@ -105,11 +109,15 @@ The device fingerprint reported to `/alpha/fingerprint/record` is **derived dete
 **Why derived rather than "pick a device from a hash bucket"** — a fixed pool caps entropy at the pool size, so once the number of keys exceeds it, keys *must* share a fingerprint. With ~50 keys and a 1000-entry pool, ~2 keys collide; with a 100-entry pool, ~20 do. A shared `thumbmark` under two different `userId`s is direct evidence of multi-account-same-machine — exactly what you don't want to manufacture. Derivation keeps every key a distinct device (collision probability 2⁻²⁵⁶) while still being stable.
 
 ```bash
-CC_FP_SALT=some-local-secret npm start   # optional: isolates fingerprints between deployments
-CC_FP_MODE=random npm start              # opt out: old random-per-process behaviour
+CC_FINGERPRINT_SALT=some-local-secret npm start   # optional: bulk-reset every key's device identity
+CC_DEVICE_PROJECT_DIR='C:\\Users\\you\\projects\\app' npm start   # optional: change the fabricated project dir (slug follows)
 ```
 
 The salt is optional but recommended: without it the derivation is a pure function of the API key, so anyone who knows the scheme could recompute your users' fingerprints. With it, the same key yields different devices on different deployments, at no cost.
+
+**The signal values are fabricated too.** The official CLI reads the real machine (Windows registry MachineGuid, NIC MACs, `os.userInfo`, `git config`); this proxy derives plausible-looking substitutes from the API key — MachineGuid's `8-4-4-4-12` shape, `xx:xx:xx:xx:xx:xx` MACs, a `DESKTOP-xxxxxx` hostname, a readable git email. Those raw values never leave process memory; only their hashes go on the wire.
+
+**Pool selection scores-and-takes-the-max rather than using modulo** — modulo would rotate *every* key's device whenever the pool grows; taking the max only affects keys where the new candidate happens to win.
 
 The hash construction follows the official CLI (`buildMachineFingerprint` / `hashSignal` in `command-code`) — `thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))` with `IB = "command-code:device-fingerprint:v1"`, and each component hashed as `sha256(IB + "\0" + value.toLowerCase())`. The previous implementation hashed random hex without the `IB` prefix and built the thumbmark from the component *hashes*; upstream cannot recompute either way (it never sees the raw `machineId`), so it was undetectable — but it is now aligned.
 
@@ -407,18 +415,18 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Based on analysis of official CLI traffic (version auto-fetched from npm registry):
+Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**) — see `PROTOCOL-FACTS-1.53.1.md`:
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; **derived deterministically from the API key** (see [Device fingerprint](#device-fingerprint-fpmode--cc_fp_mode-fpsalt--cc_fp_salt)), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
-| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
+| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
+| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init, using the same `User-Agent: cli` as generate |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
-| **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
-| **CLI Envelope** | config/memory/taste/skills/permissionMode/params |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.53.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production`, `x-co-flag: "false"`, `x-taste-learning: "false"` |
-| **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
+| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli` |
+| **Project Slug** | `x-project-slug` = `slugify(process.cwd())` — same source as `config.workingDir` |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
@@ -522,8 +530,10 @@ npm run docker:build:multi
 | `PROXY_PORT` | `3050` | Host port (compose only) |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
 | `CC_UPSTREAM_PROXY` | *(unset)* | `http://host:port` CONNECT proxy for upstream Command Code requests only |
-| `CC_FP_MODE` | `derived` | `derived` = stable per-key device fingerprint; `random` = old behaviour |
-| `CC_FP_SALT` | *(unset)* | Salt for fingerprint derivation; isolates devices between deployments |
+| `CC_FINGERPRINT_SALT` | *(unset)* | Salt for fingerprint derivation; bulk-resets every key's device identity |
+| `CC_DEVICE_PROJECT_DIR` | *(unset)* | Fabricated project dir; defaults to the built-in `C:\Users\dev\projects\app` |
+| `CC_CLI_MODE` | `agent` | Envelope `mode`: `agent\|learning\|custom-agent\|…` |
+| `CC_CLI_SESSION_MODE` | `interactive` | Lifecycle `mode`: `interactive\|non-interactive` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout in ms |
@@ -657,7 +667,7 @@ A more robust cap still belongs at the reverse proxy (`limit_conn`), since only 
 
 - **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
 - **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
-- **Multi-account + multiple instances**: `sessionStore` is still a per-process `Map`, so the same API key served by two instances gets two different sessions. **The device fingerprint is no longer affected** — it is derived, so it is the same machine across instances and restarts (see [Device fingerprint](#device-fingerprint-fpmode--cc_fp_mode-fpsalt--cc_fp_salt)). Consistent hashing on the API key (`hash $cc_key consistent`) is still recommended to keep session affinity, rather than round-robin.
+- **Multi-account + multiple instances**: `sessionStore` is still a per-process `Map`, so the same API key served by two instances gets two different sessions. **The device fingerprint is no longer affected** — it is derived, so it is the same machine across instances and restarts (see [Device fingerprint](#device-fingerprint)). Consistent hashing on the API key (`hash $cc_key consistent`) is still recommended to keep session affinity, rather than round-robin.
 
 ## Disclaimer
 

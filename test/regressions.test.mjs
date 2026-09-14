@@ -14,13 +14,14 @@ async function wire(s, path, body, headers = AUTH) {
 }
 
 // issue #17：无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词
-test('#17 chat：无 system prompt 时 params.system 为占位串而非空/缺省', async () => {
+// 形态是 CLI 的 toWireSystem 块数组（见 wire.test.mjs 的说明），占位因此是单个空格文本块。
+test('#17 chat：无 system prompt 时 params.system 为占位块而非空/缺省', async () => {
   const s = await setup();
   try {
     const { params } = await wire(s, '/v1/chat/completions',
       { model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] });
-    assert.equal(typeof params.system, 'string', 'params.system 必须是字符串');
-    assert.notEqual(params.system, '', '空 system 会触发上游注入默认提示词（#17）');
+    assert.deepEqual(params.system, [{ type: 'text', text: ' ' }],
+      '缺省会触发上游注入默认提示词（#17），占位必须是单个空格文本块');
   } finally { await s.close(); }
 });
 

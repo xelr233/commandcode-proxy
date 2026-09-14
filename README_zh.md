@@ -4,7 +4,7 @@
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
 
-基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
+逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）—— 详见 `PROTOCOL-FACTS-1.53.1.md`：
 
 **完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
@@ -77,8 +77,10 @@ commandcode/
 | `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
 | `CC_UPSTREAM_PROXY` | `upstreamProxy` |
-| `CC_FP_MODE` | `fpMode`（默认 `derived`，`random` 回退） |
-| `CC_FP_SALT` | `fpSalt` |
+| `CC_FINGERPRINT_SALT` | `fingerprintSalt`（成批更换设备身份） |
+| `CC_DEVICE_PROJECT_DIR` | `deviceProjectDir`（伪造的项目目录，与 `x-project-slug` 同源） |
+| `CC_CLI_MODE` | `cliMode`（信封 `mode`） |
+| `CC_CLI_SESSION_MODE` | `cliSessionMode`（lifecycle metadata 的 `mode`，另一个枚举） |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -88,9 +90,11 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
 
-### 设备指纹（`fpMode` / `CC_FP_MODE`，`fpSalt` / `CC_FP_SALT`）
+### 设备指纹
 
-上报给 `/alpha/fingerprint/record` 的设备指纹，现在由 API key **确定性派生**（`HMAC-SHA256(CC_FP_SALT, apiKey)`），因此一个 key 恒定对应一台设备：
+相关配置：`fingerprintSalt` / `CC_FINGERPRINT_SALT`、`deviceProjectDir` / `CC_DEVICE_PROJECT_DIR`。
+
+上报给 `/alpha/fingerprint/record` 的设备指纹由 API key **确定性派生**（`fpDigest(apiKey, field) = sha256(salt + "\\0" + apiKey + "\\0" + field)`），因此一个 key 恒定对应一台设备：
 
 | 事件 | 原行为（随机） | 现行为（派生） |
 |---|---|---|
@@ -103,11 +107,15 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **为什么用「派生」而不是「按哈希取桶选设备」** —— 固定池的熵上限就是池的大小，key 数一旦超过池容量，多个 key 就**必然**共用指纹：约 50 个 key 配 1000 个池 → 约 2 个碰撞；配 100 个池 → 约 20 个碰撞。同一个 `thumbmark` 出现在两个不同 `userId` 下，就是「多账号同机」的直接证据 —— 这正是最不该主动制造的东西。派生方案每个 key 仍是独立设备（碰撞概率 2⁻²⁵⁶），同时保持稳定。
 
 ```bash
-CC_FP_SALT=some-local-secret npm start   # 可选：隔离不同部署的指纹
-CC_FP_MODE=random npm start              # 回退：恢复原「每进程随机」行为
+CC_FINGERPRINT_SALT=some-local-secret npm start   # 可选：成批更换所有 key 的设备身份
+CC_DEVICE_PROJECT_DIR='C:\\Users\\you\\projects\\app' npm start   # 可选：改伪造的项目目录（slug 随之改变）
 ```
 
 盐是可选的但建议设：不设时派生是 API key 的纯函数，知道算法的人可以反推出你所有用户的指纹；设了之后同一个 key 在不同部署上得到不同设备，且没有额外成本。
+
+**信号值也是伪造的**：上游 CLI 读真实机器（Windows 注册表 MachineGuid、网卡 MAC、`os.userInfo`、`git config`），本代理按 API key 派生出一组**形状逼真**的替代值 —— MachineGuid 的 `8-4-4-4-12` 形状、`xx:xx:xx:xx:xx:xx` 的 MAC、`DESKTOP-xxxxxx` 主机名、可读的 git 邮箱。这些原始值只存在于进程内存，出网的只有它们的哈希。
+
+**候选池选取用「打分取最大」而非取模** —— 取模在池子扩容时会让**所有** key 一起换设备；打分取最大只影响「新候选恰好胜出」的那部分 key。
 
 哈希构造对齐官方 CLI（`command-code` 的 `buildMachineFingerprint` / `hashSignal`）：`thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))`，其中 `IB = "command-code:device-fingerprint:v1"`；各 component 按 `sha256(IB + "\0" + value.toLowerCase())` 计算。原实现直接对随机 hex 求 sha256（缺 `IB` 前缀），且 thumbmark 由各 component 的**哈希**拼成 —— 上游两种都无从验算（它拿不到原始 `machineId`），所以检测不到；现在已对齐。
 
@@ -409,14 +417,14 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 
 | 机制 | 实现 |
 |------|------|
-| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；**由 API key 确定性派生**（见[设备指纹](#设备指纹fpmode--cc_fp_modefpsalt--cc_fp_salt)）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
-| **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
+| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
+| **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`），与生成请求共用 `User-Agent: cli` |
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
-| **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
-| **CLI 信封格式** | config/memory/taste/skills/permissionMode/params |
+| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.53.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production`、`x-co-flag: "false"`、`x-taste-learning: "false"` |
-| **Project Slug** | 从 sessionId 生成的 `x-project-slug`（与真实 CLI 格式一致） |
+| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli` |
+| **Project Slug** | `x-project-slug` = `slugify(process.cwd())`，与 `config.workingDir` 同源 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
@@ -520,8 +528,10 @@ npm run docker:build:multi
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
 | `CC_UPSTREAM_PROXY` | 空 | 仅作用于 CC 上游请求的 `http://host:port` CONNECT 代理 |
-| `CC_FP_MODE` | `derived` | `derived` = 每 key 稳定设备指纹；`random` = 原行为 |
-| `CC_FP_SALT` | 空 | 指纹派生用的盐；隔离不同部署的设备 |
+| `CC_FINGERPRINT_SALT` | 空 | 指纹派生用的盐；成批更换所有 key 的设备身份 |
+| `CC_DEVICE_PROJECT_DIR` | 空 | 伪造的项目目录；留空用内置 `C:\Users\dev\projects\app` |
+| `CC_CLI_MODE` | `agent` | 信封 `mode`：`agent\|learning\|custom-agent\|…` |
+| `CC_CLI_SESSION_MODE` | `interactive` | lifecycle 的 `mode`：`interactive\|non-interactive` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
@@ -660,7 +670,7 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 
 - **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
 - **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
-- **多账号 + 多实例**：`sessionStore` 仍是进程内 `Map`，同一个 API key 打到两个实例会得到两个不同 session。**设备指纹已不再是问题** —— 它现在是派生出来的，跨实例、跨重启都是同一台设备（见[设备指纹](#设备指纹fpmode--cc_fp_modefpsalt--cc_fp_salt)）。横向扩展仍建议按 API key 做一致性哈希（`hash $cc_key consistent`）以保持 session 亲和，不要轮询。
+- **多账号 + 多实例**：`sessionStore` 仍是进程内 `Map`，同一个 API key 打到两个实例会得到两个不同 session。**设备指纹已不再是问题** —— 它现在是派生出来的，跨实例、跨重启都是同一台设备（见[设备指纹](#设备指纹)）。横向扩展仍建议按 API key 做一致性哈希（`hash $cc_key consistent`）以保持 session 亲和，不要轮询。
 
 ## 免责声明
 

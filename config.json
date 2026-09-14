@@ -8,6 +8,8 @@
   "logLevel": "info",
   "zdr": false,
   "upstreamProxy": "",
-  "fpMode": "derived",
-  "fpSalt": ""
+  "fingerprintSalt": "",
+  "deviceProjectDir": "",
+  "cliMode": "agent",
+  "cliSessionMode": "interactive"
 }

@@ -15,17 +15,57 @@ async function wireMessages(proxy, mock, path, body, headers = AUTH) {
   return { status: r.status, params: g.body.params, config: g.body.config, headers: g.headers };
 }
 
-test('chat：system 提升到 params.system，且必须是字符串', async () => {
+// params.system 的形态是 **块数组**，不是字符串 —— 对齐 CLI 的 toWireSystem：
+//   toWireSystem(e) { const t = e.length - 1;
+//     return e.map((e, n) => ({ type: 'text', text: n < t ? e.text + '\n' : e.text,
+//                               ...(e.cache ? { cache_control: { type: 'ephemeral' } } : {}) })); }
+// 早先「数组会被上游拒绝」的判断源自一次误诊（真因是 content 为字符串时整条 user 消息
+// 丢失，见 convertAnthropicToOpenAI 的注释），已更正。
+test('chat：system 提升到 params.system，形态为 CLI 的块数组', async () => {
   const s = await setup();
   try {
     const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
       model: 'deepseek/deepseek-v4-flash', stream: true,
       messages: [{ role: 'system', content: 'you are terse' }, { role: 'user', content: 'hi' }],
     });
-    assert.equal(typeof params.system, 'string', 'CC 上游要求 params.system 恒为字符串，传数组会被拒绝');
-    assert.equal(params.system, 'you are terse');
+    assert.deepEqual(params.system, [{ type: 'text', text: 'you are terse' }],
+      '单个 system 段应序列化为一个文本块（末块不加 \\n）');
     assert.equal(params.messages.length, 1, 'system 不应留在 messages 里');
     assert.equal(params.messages[0].role, 'user');
+  } finally { await s.close(); }
+});
+
+test('chat：多个 system 段时非末块补 \\n（对齐 toWireSystem）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [
+        { role: 'system', content: 'first' },
+        { role: 'system', content: 'second' },
+        { role: 'user', content: 'hi' },
+      ],
+    });
+    assert.deepEqual(params.system, [
+      { type: 'text', text: 'first\n' },
+      { type: 'text', text: 'second' },
+    ]);
+  } finally { await s.close(); }
+});
+
+test('chat：system 块上的 cache_control 原样下发（CLI 的 systemSections[].cache）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: 'cached prefix', cache_control: { type: 'ephemeral' } }] },
+        { role: 'user', content: 'hi' },
+      ],
+    });
+    assert.deepEqual(params.system, [
+      { type: 'text', text: 'cached prefix', cache_control: { type: 'ephemeral' } },
+    ]);
   } finally { await s.close(); }
 });
 
