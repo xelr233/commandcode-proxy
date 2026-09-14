@@ -100,3 +100,46 @@ test('不同 API key 各自初始化（互不复用指纹状态）', async () =>
     assert.equal(fpCount, 2, '每个 key 应各自初始化一次，实际 ' + fpCount);
   } finally { await s.close(); }
 });
+
+// components.cpuCount 是明文上传的，且可与同样明文的 cpuModel 交叉核对。
+// CLI 的 gatherRawSignals 取 os.cpus().length —— 逻辑处理器数，不是物理核心数。
+// 这张表是对「CLI 语义」的锁定：改了型号/核数就得同步改这里的期望值。
+const EXPECTED_THREADS = {
+  '12th Gen Intel(R) Core(TM) i7-12650H': 16,
+  '12th Gen Intel(R) Core(TM) i5-12400F': 12,
+  '12th Gen Intel(R) Core(TM) i9-12900K': 24,
+  '13th Gen Intel(R) Core(TM) i7-13700K': 24,
+  '13th Gen Intel(R) Core(TM) i5-13600K': 20,
+  '13th Gen Intel(R) Core(TM) i9-13900K': 32,
+  'Intel(R) Core(TM) Ultra 7 155H': 22,
+  'Intel(R) Core(TM) Ultra 9 285H': 16,   // Arrow Lake 取消超线程，核数 == 线程数
+  'Intel(R) Core(TM) i9-14900K': 32,
+  'Intel(R) Core(TM) i7-14700K': 28,
+  'AMD Ryzen 7 7800X3D': 16,
+  'AMD Ryzen 9 7950X': 32,
+  'AMD Ryzen 5 7600': 12,
+  'AMD Ryzen 9 7900X': 24,
+  'AMD Ryzen 7 5800X3D': 16,
+};
+
+test('cpuCount 是逻辑处理器数（os.cpus().length），且与 cpuModel 自洽', async () => {
+  const s = await setup();
+  try {
+    const keys = ['user_a', 'user_b', 'user_c', 'user_d', 'user_e', 'user_f', 'user_g', 'user_h'];
+    for (const k of keys) {
+      const r = await s.proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + k });
+      await r.text();
+    }
+    const fps = s.mock.seen.filter(x => x.url === '/alpha/fingerprint/record')
+      .map(x => JSON.parse(x.raw).components);
+    assert.ok(fps.length >= 6, '应覆盖到足够多的指纹样本');
+    for (const c of fps) {
+      const expected = EXPECTED_THREADS[c.cpuModel];
+      assert.ok(expected !== undefined, 'cpuModel 必须在已知表内：' + c.cpuModel);
+      assert.equal(c.cpuCount, expected,
+        `${c.cpuModel} 的 cpuCount 应为逻辑处理器数 ${expected}（CLI 取 os.cpus().length），` +
+        '填物理核数等于宣称这台机器关了超线程 —— 而 cpuModel 与 cpuCount 都是明文，可被交叉核对');
+    }
+  } finally { await s.close(); }
+});
+

@@ -65,23 +65,29 @@ function loadConfig() {
 const CFG = loadConfig();
 
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.54.0 复核未变） ──
-// CPU 型号与核心数对应表（仅 Windows x64）
+// CPU 型号与核数对应表（仅 Windows x64）。
+// ⚠️ 上网的 components.cpuCount 必须是 **threads** 而不是 cores ——
+// CLI 的 gatherRawSignals 取的是 `os.cpus().length`，即**逻辑处理器数**。
+// 这一对是明文上传的（components 里只有 machineId/mac/osUser/hostname/gitEmail 走哈希），
+// 所以 cpuModel 与 cpuCount 可以被服务端交叉核对：填物理核数等于宣称「这台机器关了超线程」，
+// 而原表 15 项全是物理核数 —— 100% 的指纹都落在这个罕见表述上，是群体分布层面的特征。
+// （实现参考 @jinyu2022 的 PR #35，数字逐项复核过。）
 const FINGERPRINT_CPUS = [
-  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
-  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
-  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14 },
-  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) Ultra 7 155H', cores: 16 },
-  { model: 'Intel(R) Core(TM) Ultra 9 285H', cores: 16 },
-  { model: 'Intel(R) Core(TM) i9-14900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) i7-14700K', cores: 20 },
-  { model: 'AMD Ryzen 7 7800X3D', cores: 8 },
-  { model: 'AMD Ryzen 9 7950X', cores: 16 },
-  { model: 'AMD Ryzen 5 7600', cores: 6 },
-  { model: 'AMD Ryzen 9 7900X', cores: 12 },
-  { model: 'AMD Ryzen 7 5800X3D', cores: 8 },
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10, threads: 16 },   // 6P+4E
+  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6,  threads: 12 },
+  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14, threads: 20 },   // 6P+8E
+  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) Ultra 7 155H',       cores: 16, threads: 22 },   // 6P+8E+2LPE（Meteor Lake 有超线程）
+  { model: 'Intel(R) Core(TM) Ultra 9 285H',       cores: 16, threads: 16 },   // 6P+8E+2LPE（Arrow Lake 取消超线程）
+  { model: 'Intel(R) Core(TM) i9-14900K',          cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) i7-14700K',          cores: 20, threads: 28 },   // 8P+12E
+  { model: 'AMD Ryzen 7 7800X3D',                  cores: 8,  threads: 16 },
+  { model: 'AMD Ryzen 9 7950X',                    cores: 16, threads: 32 },
+  { model: 'AMD Ryzen 5 7600',                     cores: 6,  threads: 12 },
+  { model: 'AMD Ryzen 9 7900X',                    cores: 12, threads: 24 },
+  { model: 'AMD Ryzen 7 5800X3D',                  cores: 8,  threads: 16 },
 ];
 const FINGERPRINT_MEMS = [8, 16, 24, 32, 48, 64];
 const FINGERPRINT_TZS = [
@@ -191,7 +197,7 @@ function generateFingerprint(apiKey) {
       arch: DEVICE_PROFILE.arch,
       osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
-      cpuCount: cpuEntry.cores,
+      cpuCount: cpuEntry.threads,   // 逻辑处理器数，对齐 CLI 的 os.cpus().length
       memGiB,
       isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
