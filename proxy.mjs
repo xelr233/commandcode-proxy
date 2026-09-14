@@ -572,14 +572,13 @@ function buildCcRequest(openaiReq) {
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
-  // 存的是**重写后**的名字 —— 对齐 CLI 的 toWireMessages：const r = toWireToolName(t.name);
-  // n.set(t.id, r)，后面的 tool-result 再从这张表里查同一个名字。
+  // 名字原样透传（理由见 toWireToolName 删除处的注释）。
   const toolNameMap = {};
   for (const msg of chatMessages) {
     if (msg.role === 'assistant' && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         if (tc.id) {
-          toolNameMap[tc.id] = toWireToolName(tc.function?.name || '');
+          toolNameMap[tc.id] = tc.function?.name || '';
         }
       }
     }
@@ -632,7 +631,7 @@ function buildCcRequest(openaiReq) {
           parts.push({
             type: 'tool-call',
             toolCallId: tc.id,
-            toolName: toWireToolName(tc.function?.name || ''),
+            toolName: tc.function?.name || '',
             input: (typeof tc.function?.arguments === 'string' ? tryParseJSON(tc.function.arguments) : (tc.function?.arguments || {})),
           });
         }
@@ -640,14 +639,13 @@ function buildCcRequest(openaiReq) {
       return { role: 'assistant', content: parts };
     }
     if (msg.role === 'tool') {
-      // toolName 必须与上面 tool-call 里的名字一致 —— 两边都走 toWireToolName，
-      // 否则上游看到的调用名与结果名对不上（CLI 用同一张 map 保证这一点）
+      // toolName 与上面 tool-call 里的一致（同一张 map），不重命名
       return {
         role: 'tool',
         content: [{
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
-          toolName: toolNameMap[msg.tool_call_id] || toWireToolName(msg.name || ''),
+          toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
           output: { type: 'text', value: toWireToolOutputValue(msg.content) },
         }],
       };
@@ -712,7 +710,7 @@ function buildCcRequest(openaiReq) {
   }
   // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
   // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段；
-  // 且 tools 声明**不做**名字重写（重写只发生在 messages 里，见 WIRE_TOOL_ALIASES 注释）
+  // 且**不做**任何名字重写（理由见下面「工具名重写整段删除」的注释）
   body.params.tools = (tools || []).map(t => ({
       name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
@@ -737,21 +735,31 @@ function buildCcRequest(openaiReq) {
   return body;
 }
 
-// 线上唯一的工具名重写 —— CLI 的 toWireToolName(e){return e===rw?nw:e}，
-// 其中 nw="search_tools"、rw="tool_search"（command-code@1.54.0 dist/cli.mjs）。
-// 只用于**消息里**的 tool-call / tool-result（CLI 的 toWireMessages），
-// 不用于 params.tools 声明 —— CLI 的 toWireTools 是原样 map {name,description,input_schema}。
-const WIRE_TOOL_ALIASES = { tool_search: 'search_tools' };
-function toWireToolName(name) { return WIRE_TOOL_ALIASES[name] || name; }
-
-// 注意：CLI 里还有一张四项表 ow
-//   {bash_output:{to:'shell_output'},
-//    task_output:{to:'shell_output',defaults:{wait:'exit'}},
-//    [rw]:{to:nw},
-//    read_multiple_files:{to:'read_file'}}
-// 那是 resolveToolNameAlias 的**入站**别名：模型调了退役工具名时，本地按新名字执行，
-// 并回一句自然语言 note（"the tool \`x\` is now \`y\`"）让模型下次改口，还会补 defaults。
-// 它是执行语义、不是 wire 变换，照搬到这里会同时改错方向和改错表（见 issue #37）。
+// ── 工具名为什么一个都不重命名（已删掉的别名表的墓志铭） ──────────────
+// 上游 d063b47 曾引入一张 4 项别名表并作用于 params.tools[].name。查 CLI 源码后
+// （command-code@1.54.0 dist/cli.mjs）确认：**wire 协议里没有工具重命名这回事**。
+//
+// CLI 里确实存在两个改名的函数，但都不适用于反代：
+//
+//   toWireToolName(e){return e===rw?nw:e}      // rw="tool_search" → nw="search_tools"
+//     —— 只作用在 toWireMessages（tool-call 与 tool-result，两边同名），
+//        不作用在 toWireTools（声明原样下发）。它的存在前提是 CLI 自己退役过
+//        tool_search 这个名字：createRetiredToolSearchTool 给的 visible:()=>false，
+//        该工具从不进 params.tools，只有重放旧会话时历史里才会残留这个旧名。
+//
+//   resolveToolNameAlias(ow 表)                 // bash_output/task_output/read_multiple_files
+//     —— 被工具执行器调用：模型喊了退役名时本地按新名跑，回一句给模型看的
+//        "Repair note"，并按 defaults 补参（task_output 会补 wait:"exit"）。
+//        这是执行语义、不是 wire 变换。
+//
+// 反代没有这个前提：params.tools 由下游客户端给出，proxy 没有 catalog、没有退役名，
+// 请求里出现的每个名字对 proxy 来说都是当前名。若强行重命名，一旦客户端恰好声明了
+// 一个叫 tool_search 的工具，就会变成「声明 tool_search、消息 search_tools」——
+// 下游按自己声明的名字派发不到工具（issue #36 / #37 的根因）。
+//
+// 因此这里全程原样透传。若将来真要支持「重放真实 CLI 旧会话」，正确做法是**入站**
+// 归一化 + 显式开关，并连 defaults 一起补，与 resolveToolNameAlias 同语义；
+// 绝不要做成「上行改、下行不改」。
 
 // CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
 function toWireToolOutputValue(content) {

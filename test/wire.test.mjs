@@ -166,10 +166,11 @@ test('responses：function_call_output 映射成 tool 消息', async () => {
   } finally { await s.close(); }
 });
 
-// ── 工具名重写（issue #37） ──────────────────────────────
-// CLI 的 toWireToolName(e){return e===rw?nw:e}，rw="tool_search"、nw="search_tools"：
-// **只有这一项**，且只作用于 toWireMessages（tool-call 与 tool-result），
-// 不作用于 toWireTools（声明原样下发）。ow 表是另一回事（入站执行别名，见 proxy.mjs 注释）。
+// ── 工具名完全不重命名（issue #36 / #37） ──────────────
+// wire 协议里没有工具重命名这回事。CLI 的 toWireToolName 只服务于「重放自家退役
+// 工具名的旧会话」（tool_search 在 CLI 里 visible:()=>false，从不进声明）；反代没有
+// catalog、没有退役名，因此声明与消息都必须原样透传 —— 只要有一处改名，下游就会按
+// 自己声明的名字派发不到工具。
 test('tools 声明不做名字重写（CLI 的 toWireTools 是原样 map）', async () => {
   const s = await setup();
   try {
@@ -184,7 +185,7 @@ test('tools 声明不做名字重写（CLI 的 toWireTools 是原样 map）', as
   } finally { await s.close(); }
 });
 
-test('tool_search 在 tool-call 里被重写为 search_tools（CLI 唯一一项线上别名）', async () => {
+test('tool_search 在 tool-call 里也**不**被重写（不套用 CLI 自家的退役名归一化）', async () => {
   const s = await setup();
   try {
     const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
@@ -194,9 +195,12 @@ test('tool_search 在 tool-call 里被重写为 search_tools（CLI 唯一一项�
           tool_calls: [{ id: 'c1', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] },
         { role: 'tool', tool_call_id: 'c1', content: 'r' },
       ],
+      tools: [{ type: 'function', function: { name: 'tool_search', parameters: { type: 'object', properties: {} } } }],
     });
     const call = params.messages.find(m => m.role === 'assistant').content.find(p => p.type === 'tool-call');
-    assert.equal(call.toolName, 'search_tools', 'rw → nw 是 CLI 唯一的线上重写');
+    assert.equal(call.toolName, 'tool_search',
+      '客户端声明的就是 tool_search，消息里必须还是它；改成 search_tools 下游就派发不到');
+    assert.equal(params.tools[0].name, 'tool_search', '声明与消息必须同名');
   } finally { await s.close(); }
 });
 
@@ -215,11 +219,11 @@ test('tool-result 的 toolName 与 tool-call 一致（CLI 用同一张 map）', 
     const res = params.messages.find(m => m.role === 'tool').content[0];
     assert.equal(res.toolName, call.toolName,
       '调用名与结果名对不上会被上游判为无效的工具结果');
-    assert.equal(res.toolName, 'search_tools');
+    assert.equal(res.toolName, 'tool_search');
   } finally { await s.close(); }
 });
 
-test('未在别名表里的工具名不被改写（tools 声明与 messages 都不动）', async () => {
+test('普通工具名在 tools 声明与 messages 里都不动', async () => {
   const s = await setup();
   try {
     const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
