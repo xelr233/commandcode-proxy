@@ -572,12 +572,14 @@ function buildCcRequest(openaiReq) {
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
+  // 存的是**重写后**的名字 —— 对齐 CLI 的 toWireMessages：const r = toWireToolName(t.name);
+  // n.set(t.id, r)，后面的 tool-result 再从这张表里查同一个名字。
   const toolNameMap = {};
   for (const msg of chatMessages) {
     if (msg.role === 'assistant' && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         if (tc.id) {
-          toolNameMap[tc.id] = tc.function?.name || '';
+          toolNameMap[tc.id] = toWireToolName(tc.function?.name || '');
         }
       }
     }
@@ -630,7 +632,7 @@ function buildCcRequest(openaiReq) {
           parts.push({
             type: 'tool-call',
             toolCallId: tc.id,
-            toolName: tc.function?.name || '',
+            toolName: toWireToolName(tc.function?.name || ''),
             input: (typeof tc.function?.arguments === 'string' ? tryParseJSON(tc.function.arguments) : (tc.function?.arguments || {})),
           });
         }
@@ -638,12 +640,14 @@ function buildCcRequest(openaiReq) {
       return { role: 'assistant', content: parts };
     }
     if (msg.role === 'tool') {
+      // toolName 必须与上面 tool-call 里的名字一致 —— 两边都走 toWireToolName，
+      // 否则上游看到的调用名与结果名对不上（CLI 用同一张 map 保证这一点）
       return {
         role: 'tool',
         content: [{
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
-          toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
+          toolName: toolNameMap[msg.tool_call_id] || toWireToolName(msg.name || ''),
           output: { type: 'text', value: toWireToolOutputValue(msg.content) },
         }],
       };
@@ -707,9 +711,10 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
-  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
+  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段；
+  // 且 tools 声明**不做**名字重写（重写只发生在 messages 里，见 WIRE_TOOL_ALIASES 注释）
   body.params.tools = (tools || []).map(t => ({
-      name: toWireToolName(t.function?.name || t.name || ''),
+      name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
@@ -732,14 +737,21 @@ function buildCcRequest(openaiReq) {
   return body;
 }
 
-// CLI 发送前会重写部分工具名（resolveToolNameAlias / ow 表）
-const TOOL_NAME_ALIASES = {
-  bash_output: 'shell_output',
-  task_output: 'shell_output',
-  tool_search: 'search_tools',
-  read_multiple_files: 'read_file',
-};
-function toWireToolName(name) { return TOOL_NAME_ALIASES[name] || name; }
+// 线上唯一的工具名重写 —— CLI 的 toWireToolName(e){return e===rw?nw:e}，
+// 其中 nw="search_tools"、rw="tool_search"（command-code@1.54.0 dist/cli.mjs）。
+// 只用于**消息里**的 tool-call / tool-result（CLI 的 toWireMessages），
+// 不用于 params.tools 声明 —— CLI 的 toWireTools 是原样 map {name,description,input_schema}。
+const WIRE_TOOL_ALIASES = { tool_search: 'search_tools' };
+function toWireToolName(name) { return WIRE_TOOL_ALIASES[name] || name; }
+
+// 注意：CLI 里还有一张四项表 ow
+//   {bash_output:{to:'shell_output'},
+//    task_output:{to:'shell_output',defaults:{wait:'exit'}},
+//    [rw]:{to:nw},
+//    read_multiple_files:{to:'read_file'}}
+// 那是 resolveToolNameAlias 的**入站**别名：模型调了退役工具名时，本地按新名字执行，
+// 并回一句自然语言 note（"the tool \`x\` is now \`y\`"）让模型下次改口，还会补 defaults。
+// 它是执行语义、不是 wire 变换，照搬到这里会同时改错方向和改错表（见 issue #37）。
 
 // CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
 function toWireToolOutputValue(content) {

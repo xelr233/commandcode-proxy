@@ -165,3 +165,75 @@ test('responses：function_call_output 映射成 tool 消息', async () => {
     assert.ok(params.messages.some(m => m.role === 'tool'), 'function_call_output 应产出 tool 消息');
   } finally { await s.close(); }
 });
+
+// ── 工具名重写（issue #37） ──────────────────────────────
+// CLI 的 toWireToolName(e){return e===rw?nw:e}，rw="tool_search"、nw="search_tools"：
+// **只有这一项**，且只作用于 toWireMessages（tool-call 与 tool-result），
+// 不作用于 toWireTools（声明原样下发）。ow 表是另一回事（入站执行别名，见 proxy.mjs 注释）。
+test('tools 声明不做名字重写（CLI 的 toWireTools 是原样 map）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, messages: [{ role: 'user', content: 'q' }],
+      tools: ['bash_output', 'read_multiple_files', 'tool_search'].map(n => ({
+        type: 'function', function: { name: n, description: '', parameters: { type: 'object', properties: {} } },
+      })),
+    });
+    assert.deepEqual(params.tools.map(t => t.name), ['bash_output', 'read_multiple_files', 'tool_search'],
+      '客户端声明的名字必须原样下发，否则客户端按自己的声明找不到工具');
+  } finally { await s.close(); }
+});
+
+test('tool_search 在 tool-call 里被重写为 search_tools（CLI 唯一一项线上别名）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: null,
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: 'r' },
+      ],
+    });
+    const call = params.messages.find(m => m.role === 'assistant').content.find(p => p.type === 'tool-call');
+    assert.equal(call.toolName, 'search_tools', 'rw → nw 是 CLI 唯一的线上重写');
+  } finally { await s.close(); }
+});
+
+test('tool-result 的 toolName 与 tool-call 一致（CLI 用同一张 map）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: null,
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', name: 'tool_search', content: 'r' },
+      ],
+    });
+    const call = params.messages.find(m => m.role === 'assistant').content.find(p => p.type === 'tool-call');
+    const res = params.messages.find(m => m.role === 'tool').content[0];
+    assert.equal(res.toolName, call.toolName,
+      '调用名与结果名对不上会被上游判为无效的工具结果');
+    assert.equal(res.toolName, 'search_tools');
+  } finally { await s.close(); }
+});
+
+test('未在别名表里的工具名不被改写（tools 声明与 messages 都不动）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: null,
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: 'r' },
+      ],
+      tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+    });
+    assert.equal(params.tools[0].name, 'get_weather');
+    assert.equal(params.messages.find(m => m.role === 'assistant').content.find(p => p.type === 'tool-call').toolName, 'get_weather');
+    assert.equal(params.messages.find(m => m.role === 'tool').content[0].toolName, 'get_weather');
+  } finally { await s.close(); }
+});
+
