@@ -22,8 +22,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # engines 下限是 18；Dockerfile 用 22；中间放 20 覆盖 LTS 跨度
-        node: ['18', '20', '22']
+        # engines 下限是 18；Dockerfile 用 22；中间放 20 覆盖 LTS 跨度；
+        # 24 是当前实际部署用的版本（systemd 里跑的就是 v24.x）—— 生产版本必须在矩阵里
+        node: ['18', '20', '22', '24']
     name: node ${{ matrix.node }}
     steps:
       - name: Checkout
