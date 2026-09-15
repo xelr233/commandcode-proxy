@@ -278,3 +278,28 @@ test('#38 message 里的 "<NNN>" 前缀优先于 statusCode（对齐 CLI 的取�
   } finally { await s.close(); }
 });
 
+
+// 流空闲超时后必须以 end() 收尾。原先走的是 res.write(err) 紧跟 res.destroy()：
+// write 是异步的，destroy 会把未刷出的缓冲丢掉并发 RST，反向代理那里就是
+// "upstream prematurely closed connection" → 502，或者客户端看到 connection error。
+// 断言方式：客户端必须能**完整读到**已产生的 delta 与超时错误事件 —— destroy 会让
+// 这条读挂掉（ECONNRESET / 截断），end 则正常收束。
+test('流空闲超时：已产生的内容 + 错误事件都能完整送达（不能 destroy 客户端 socket）', async () => {
+  const s = await setup({
+    env: { CC_STREAM_IDLE_MS: '300' },
+    onRequest: (req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('{"type":"text-start"}\n');
+      res.write('{"type":"text-delta","text":"partial-content"}\n');
+      return true;   // 接管后挂住：不再发任何数据 → 触发空闲超时
+    },
+  });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', { ...CHAT, stream: true }, AUTH);
+    const text = await r.text();
+    assert.equal(r.status, 200);
+    assert.ok(text.includes('partial-content'), '已发出的内容不能因为收尾方式而丢失');
+    assert.ok(text.includes('rate_limit_error'), '超时错误事件必须完整送进流里');
+  } finally { await s.close(); }
+});
+
