@@ -202,3 +202,79 @@ test('#38 回归：tool-calls 仍报 tool_use / tool_calls', async () => {
     assert.equal(a.json.stop_reason, 'tool_use');
   } finally { await s.close(); }
 });
+
+// 回归：#38 排查期间发现的日志噪音。上游每个响应都会发一串无内容事件
+// （text-start / text-end / start / start-step / reasoning-start / reasoning-end /
+//  provider-metadata / tool-input-* / tool-error）。三条非流式路径原先缺少静默列表，
+// 全部掉进 default 打成 'Unknown CC event type'，线上刷屏并把真正的错误淹掉。
+test('标准 NDJSON 序列不产生任何 Unknown CC event type 警告（三协议 × 流式/非流式）', async () => {
+  const s = await setup();
+  try {
+    const chat = { model: 'm', messages: [{ role: 'user', content: 'hi' }] };
+    const msg = { model: 'm', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] };
+    await (await s.proxy.post('/v1/chat/completions', { ...chat, stream: true }, AUTH)).text();
+    await (await s.proxy.post('/v1/chat/completions', chat, AUTH)).text();
+    await (await s.proxy.post('/v1/messages', { ...msg, stream: true }, { 'x-api-key': 'user_test' })).text();
+    await (await s.proxy.post('/v1/messages', msg, { 'x-api-key': 'user_test' })).text();
+    await (await s.proxy.post('/v1/responses', { model: 'm', stream: true, input: 'hi' }, AUTH)).text();
+    await (await s.proxy.post('/v1/responses', { model: 'm', input: 'hi' }, AUTH)).text();
+
+    const logs = s.proxy.logs();
+    assert.ok(!logs.includes('Unknown CC event type'),
+      '不应出现 Unknown CC event type 警告，实际日志片段：\n' +
+      logs.split('\n').filter(l => l.includes('Unknown CC')).join('\n'));
+  } finally { await s.close(); }
+});
+
+
+// 上游 error 事件自带 statusCode 时必须用它 —— CLI 的 readStreamErrorEvent 读的就是这个字段，
+// 取值链是 parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null。
+// 原实现只看 message 里的 "<NNN>" 前缀，statusCode 全被丢掉 → 429/503 塌成 502。
+test('#38 error 事件带 statusCode 时按其映射（429 而非 502）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"partial"}',
+    '{"type":"error","error":{"message":"providers are currently at capacity","statusCode":429}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    const j = await r.json();
+    assert.equal(r.status, 429, 'statusCode 是上游给的，不能抹成 502');
+    assert.equal(j.error.type, 'rate_limit_error');
+    assert.equal(j.retry_after, 30, '429 要带退避提示，否则客户端不知道等多久');
+  } finally { await s.close(); }
+});
+
+test('#38 error 事件带 statusCode 时按其映射（503 而非 502）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"error","error":{"message":"service unavailable","statusCode":503}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    assert.equal(r.status, 503);
+  } finally { await s.close(); }
+});
+
+test('#38 error 事件没有 statusCode 时仍回落 502（保持原行为）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"error","error":{"message":"something broke"}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    assert.equal(r.status, 502);
+  } finally { await s.close(); }
+});
+
+test('#38 message 里的 "<NNN>" 前缀优先于 statusCode（对齐 CLI 的取值链）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"error","error":{"message":"<400> bad request","statusCode":503}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    assert.equal(r.status, 400, '<NNN> 前缀是最优先的取值来源');
+  } finally { await s.close(); }
+});
+
