@@ -1116,8 +1116,22 @@ function readBody(req) {
         settled = true;
         chunks.length = 0;
         const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
-        const err = new Error(`Request body exceeds ${mb}MB limit`);
+        // 只报上限等于让人去猜自己超了多少 —— 客户端要据此决定"拆请求"还是"去申请提额"。
+        // nginx 开了 proxy_request_buffering 时会带 Content-Length，据此给出真实体积；
+        // 没有该头（chunked）时退回"已收到多少"，并标注它是下界。
+        const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
+        const known = Number.isFinite(declared) && declared > 0;
+        const bytes = known ? declared : totalSize;
+        const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
+        log('warn', 'Request body rejected (too large)', {
+          path: req.url,
+          limitMB: mb,
+          bodyMB: +(bytes / 1048576).toFixed(1),
+          exact: known,
+        });
+        const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
         err.statusCode = 413;
+        err.bodyBytes = bytes;
         reject(err);
         return;
       }

@@ -141,3 +141,21 @@ test('CC_MAX_INFLIGHT 不限制探活端点', async () => {
     const r1 = await first; await r1.text();
   } finally { await s.close(); }
 });
+
+// 413 只报上限等于让人去猜。这条断言锁住"必须报出实际体积"，
+// 客户端才能判断是该拆请求还是该去申请提额。
+test('413 报错包含实际请求体积（客户端要知道超了多少）', async () => {
+  const s = await setup({ env: { CC_MAX_BODY_MB: '1' } });
+  try {
+    const body = JSON.stringify({ model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'x'.repeat(3 * 1024 * 1024) }] });
+    const r = await s.proxy.post('/v1/chat/completions', body, AUTH);
+    assert.equal(r.status, 413);
+    const j = await r.json();
+    assert.match(j.error.message, /exceeds 1MB limit/);
+    assert.match(j.error.message, /body is \d+\.\d+MB/,
+      '必须报出实际体积，不能只说上限。实际消息：' + j.error.message);
+    assert.ok(s.proxy.logs().includes('Request body rejected (too large)'));
+  } finally { await s.close(); }
+});
+
